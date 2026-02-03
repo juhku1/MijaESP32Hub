@@ -30,6 +30,8 @@ typedef struct {
     uint32_t last_seen;
     bool visible;  // Näkyykö laite
     char name[MAX_NAME_LEN];
+    bool show_mac;  // Näytetäänkö MAC-osoite
+    uint16_t field_mask;  // Bitmask: mitä kenttiä näytetään (temp, hum, bat, batMv, rssi)
     bool has_sensor_data;
     float temperature;
     uint8_t humidity;
@@ -37,9 +39,85 @@ typedef struct {
     uint16_t battery_mv;
 } ble_device_t;
 
+// Field mask bitit
+#define FIELD_TEMP   (1 << 0)
+#define FIELD_HUM    (1 << 1)
+#define FIELD_BAT    (1 << 2)
+#define FIELD_BATMV  (1 << 3)
+#define FIELD_RSSI   (1 << 4)
+#define FIELD_ALL    0xFFFF  // Kaikki kentät oletuksena
+
 static ble_device_t devices[MAX_DEVICES];
 static int device_count = 0;
 static httpd_handle_t server = NULL;
+
+// Tallenna laitteen asetukset NVS:ään
+static void save_device_settings(uint8_t *addr, const char *name, bool show_mac, uint16_t field_mask) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        char base_key[20];
+        snprintf(base_key, sizeof(base_key), "%02X%02X%02X%02X%02X%02X",
+            addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+        
+        // Tallenna nimi
+        if (name && strlen(name) > 0) {
+            char name_key[24];
+            snprintf(name_key, sizeof(name_key), "%s_n", base_key);
+            nvs_set_str(nvs, name_key, name);
+        }
+        
+        // Tallenna show_mac
+        char mac_key[24];
+        snprintf(mac_key, sizeof(mac_key), "%s_m", base_key);
+        nvs_set_u8(nvs, mac_key, show_mac ? 1 : 0);
+        
+        // Tallenna field_mask
+        char field_key[24];
+        snprintf(field_key, sizeof(field_key), "%s_f", base_key);
+        nvs_set_u16(nvs, field_key, field_mask);
+        
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Tallennettu asetukset: %s, name=%s, show_mac=%d, fields=0x%04X", 
+                 base_key, name, show_mac, field_mask);
+    }
+}
+
+// Lataa laitteen asetukset NVS:stä
+static void load_device_settings(uint8_t *addr, char *name_out, bool *show_mac_out, uint16_t *field_mask_out) {
+    nvs_handle_t nvs;
+    // Oletusarvot
+    name_out[0] = '\0';
+    *show_mac_out = true;
+    *field_mask_out = FIELD_ALL;
+    
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+        char base_key[20];
+        snprintf(base_key, sizeof(base_key), "%02X%02X%02X%02X%02X%02X",
+            addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+        
+        // Lataa nimi
+        char name_key[24];
+        snprintf(name_key, sizeof(name_key), "%s_n", base_key);
+        size_t name_len = MAX_NAME_LEN;
+        nvs_get_str(nvs, name_key, name_out, &name_len);
+        
+        // Lataa show_mac
+        char mac_key[24];
+        snprintf(mac_key, sizeof(mac_key), "%s_m", base_key);
+        uint8_t show_mac_val = 1;
+        if (nvs_get_u8(nvs, mac_key, &show_mac_val) == ESP_OK) {
+            *show_mac_out = show_mac_val ? true : false;
+        }
+        
+        // Lataa field_mask
+        char field_key[24];
+        snprintf(field_key, sizeof(field_key), "%s_f", base_key);
+        nvs_get_u16(nvs, field_key, field_mask_out);
+        
+        nvs_close(nvs);
+    }
+}
 
 // Tallenna laitteen näkyvyysasetus NVS:ään
 static void save_visibility(uint8_t *addr, bool visible) {
@@ -49,14 +127,12 @@ static void save_visibility(uint8_t *addr, bool visible) {
         snprintf(key, sizeof(key), "%02X%02X%02X%02X%02X%02X",
             addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
         uint8_t val = visible ? 1 : 0;
-        ESP_LOGI(TAG, "NVS tallennetaan: %s -> %d", key, val);
+        ESP_LOGI(TAG, "NVS tallennetaan visibility: %s -> %d", key, val);
         nvs_set_u8(nvs, key, val);
         nvs_commit(nvs);
         nvs_close(nvs);
     }
 }
-
-// Lataa laitteen näkyvyysasetus NVS:stä (oletuksena näkyvissä)
 static bool load_visibility(uint8_t *addr) {
     nvs_handle_t nvs;
     uint8_t val = 1;  // Oletuksena näkyvissä
@@ -88,9 +164,16 @@ static int find_or_add_device(uint8_t *addr) {
     if (device_count < MAX_DEVICES) {
         memcpy(devices[device_count].addr, addr, 6);
         devices[device_count].visible = load_visibility(addr);
-        memset(devices[device_count].name, 0, MAX_NAME_LEN);
+        
+        // Lataa muut asetukset
+        load_device_settings(addr, devices[device_count].name, 
+                           &devices[device_count].show_mac,
+                           &devices[device_count].field_mask);
+        
         devices[device_count].has_sensor_data = false;
-        ESP_LOGI(TAG, "Uusi laite löydetty");
+        ESP_LOGI(TAG, "Uusi laite löydetty: name=%s, show_mac=%d, fields=0x%04X",
+                 devices[device_count].name, devices[device_count].show_mac,
+                 devices[device_count].field_mask);
         return device_count++;
     }
     return -1;
@@ -107,11 +190,16 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
             struct ble_hs_adv_fields fields;
             if (ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data) == 0) {
                 
-                // Laitteen nimi
+                // Laitteen nimi (kopioidaan vain jos käyttäjä ei ole asettanut omaa nimeä)
                 if (fields.name != NULL && fields.name_len > 0) {
-                    int copy_len = (fields.name_len < MAX_NAME_LEN - 1) ? fields.name_len : MAX_NAME_LEN - 1;
-                    memcpy(devices[idx].name, fields.name, copy_len);
-                    devices[idx].name[copy_len] = '\0';
+                    if (devices[idx].name[0] == '\0') {
+                        int copy_len = (fields.name_len < MAX_NAME_LEN - 1) ? fields.name_len : MAX_NAME_LEN - 1;
+                        memcpy(devices[idx].name, fields.name, copy_len);
+                        devices[idx].name[copy_len] = '\0';
+                        ESP_LOGI(TAG, "BLE-nimi kopioitu: %s", devices[idx].name);
+                    }
+                } else if (devices[idx].name[0] == '\0') {
+                    ESP_LOGI(TAG, "BLE-advertsissä ei nimeä tälle laitteelle");
                 }
                 
                 // Sensoridata (pvvx/ATC-muoto)
@@ -147,7 +235,7 @@ static void ble_app_on_sync(void) {
     struct ble_gap_disc_params disc_params = {0};
     disc_params.itvl = 0x10;
     disc_params.window = 0x10;
-    disc_params.passive = 1;
+    disc_params.passive = 0;  // Active scan jotta saadaan scan response (nimi)
     ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params, ble_gap_event, NULL);
 }
 
@@ -245,9 +333,18 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
         
         char item[512];
         if (devices[i].has_sensor_data) {
+            // Määritä mitä kenttiä laite tukee
+            uint16_t available = 0;
+            if (devices[i].temperature != 0) available |= FIELD_TEMP;
+            if (devices[i].humidity != 0) available |= FIELD_HUM;
+            if (devices[i].battery_pct != 0) available |= FIELD_BAT;
+            if (devices[i].battery_mv != 0) available |= FIELD_BATMV;
+            available |= FIELD_RSSI; // RSSI aina saatavilla
+            
             snprintf(item, sizeof(item),
                 "%s{\"addr\":\"%s\",\"name\":\"%s\",\"rssi\":%d,"
-                "\"hasSensor\":true,\"temp\":%.1f,\"hum\":%d,\"bat\":%d,\"batMv\":%d,\"visible\":%s}",
+                "\"hasSensor\":true,\"temp\":%.1f,\"hum\":%d,\"bat\":%d,\"batMv\":%d,"
+                "\"visible\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
                 first ? "" : ",",
                 addr_str,
                 devices[i].name[0] ? devices[i].name : "Unknown",
@@ -256,15 +353,22 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
                 devices[i].humidity,
                 devices[i].battery_pct,
                 devices[i].battery_mv,
-                devices[i].visible ? "true" : "false");
+                devices[i].visible ? "true" : "false",
+                devices[i].show_mac ? "true" : "false",
+                devices[i].field_mask,
+                available);
         } else {
             snprintf(item, sizeof(item),
-                "%s{\"addr\":\"%s\",\"name\":\"%s\",\"rssi\":%d,\"hasSensor\":false,\"visible\":%s}",
+                "%s{\"addr\":\"%s\",\"name\":\"%s\",\"rssi\":%d,"
+                "\"hasSensor\":false,\"visible\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
                 first ? "" : ",",
                 addr_str,
                 devices[i].name[0] ? devices[i].name : "Unknown",
                 devices[i].rssi,
-                devices[i].visible ? "true" : "false");
+                devices[i].visible ? "true" : "false",
+                devices[i].show_mac ? "true" : "false",
+                devices[i].field_mask,
+                FIELD_RSSI); // Vain RSSI saatavilla
         }
         strcat(json, item);
         first = false;
@@ -348,6 +452,174 @@ static esp_err_t api_toggle_visibility_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// Tunnista laitteen "signatuuri" (mitkä kentät sillä on)
+static uint16_t get_device_signature(const ble_device_t *dev) {
+    uint16_t sig = 0;
+    if (dev->has_sensor_data) {
+        sig |= (1 << 0); // On sensor-laite
+        if (dev->temperature != 0) sig |= (1 << 1);
+        if (dev->humidity != 0) sig |= (1 << 2);
+        if (dev->battery_pct != 0) sig |= (1 << 3);
+        if (dev->battery_mv != 0) sig |= (1 << 4);
+    }
+    return sig;
+}
+
+static esp_err_t api_update_settings_handler(httpd_req_t *req) {
+    char buf[512];
+    int ret, remaining = req->content_len;
+    
+    if (remaining >= sizeof(buf)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Content too long");
+        return ESP_FAIL;
+    }
+    
+    ret = httpd_req_recv(req, buf, remaining);
+    if (ret <= 0) {
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+            httpd_resp_send_408(req);
+        }
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    ESP_LOGI(TAG, "Update settings request: %s", buf);
+    
+    // Parsitaan parametrit: addr, name, show_mac, field_mask, apply_to_similar
+    char addr_str[64] = {0};
+    char name[MAX_NAME_LEN] = {0};
+    int show_mac = 1;
+    int field_mask = FIELD_ALL;
+    int apply_to_similar = 0;
+    
+    char *addr_param = strstr(buf, "addr=");
+    char *name_param = strstr(buf, "&name=");
+    char *show_mac_param = strstr(buf, "&show_mac=");
+    char *field_mask_param = strstr(buf, "&field_mask=");
+    char *apply_param = strstr(buf, "&apply_to_similar=");
+    
+    if (addr_param) {
+        sscanf(addr_param, "addr=%60[^&]", addr_str);
+        
+        // URL-dekoodaus
+        char decoded[64];
+        int j = 0;
+        for (int i = 0; addr_str[i] && j < 63; i++) {
+            if (addr_str[i] == '%' && addr_str[i+1] && addr_str[i+2]) {
+                char hex[3] = {addr_str[i+1], addr_str[i+2], 0};
+                // Tue sekä isoja että pieniä kirjaimia (%3A ja %3a)
+                char c;
+                if (hex[0] >= 'a') hex[0] -= 32;
+                if (hex[1] >= 'a') hex[1] -= 32;
+                sscanf(hex, "%hhX", &c);
+                decoded[j++] = c;
+                i += 2;
+            } else if (addr_str[i] == '+') {
+                decoded[j++] = ' ';
+            } else {
+                decoded[j++] = addr_str[i];
+            }
+        }
+        decoded[j] = '\0';
+        strcpy(addr_str, decoded);
+    }
+    
+    if (name_param) {
+        sscanf(name_param, "&name=%60[^&]", name);
+        // URL-dekoodaus nimelle
+        char decoded[MAX_NAME_LEN];
+        int j = 0;
+        for (int i = 0; name[i] && j < MAX_NAME_LEN-1; i++) {
+            if (name[i] == '%' && name[i+1] && name[i+2]) {
+                char hex[3] = {name[i+1], name[i+2], 0};
+                char c;
+                if (hex[0] >= 'a') hex[0] -= 32;
+                if (hex[1] >= 'a') hex[1] -= 32;
+                sscanf(hex, "%hhX", &c);
+                decoded[j++] = c;
+                i += 2;
+            } else if (name[i] == '+') {
+                decoded[j++] = ' ';
+            } else {
+                decoded[j++] = name[i];
+            }
+        }
+        decoded[j] = '\0';
+        strcpy(name, decoded);
+    }
+    
+    if (show_mac_param) {
+        sscanf(show_mac_param, "&show_mac=%d", &show_mac);
+    }
+    
+    if (field_mask_param) {
+        sscanf(field_mask_param, "&field_mask=%d", &field_mask);
+    }
+    
+    if (apply_param) {
+        sscanf(apply_param, "&apply_to_similar=%d", &apply_to_similar);
+    }
+    
+    ESP_LOGI(TAG, "Päivitetään laite: %s, name='%s', show_mac=%d, fields=0x%04X, apply=%d",
+             addr_str, name, show_mac, field_mask, apply_to_similar);
+    
+    // Etsi laite
+    int target_idx = -1;
+    for (int i = 0; i < device_count; i++) {
+        char dev_addr[18];
+        snprintf(dev_addr, sizeof(dev_addr), "%02X:%02X:%02X:%02X:%02X:%02X",
+            devices[i].addr[0], devices[i].addr[1], devices[i].addr[2],
+            devices[i].addr[3], devices[i].addr[4], devices[i].addr[5]);
+        
+        if (strcmp(dev_addr, addr_str) == 0) {
+            target_idx = i;
+            break;
+        }
+    }
+    
+    if (target_idx == -1) {
+        ESP_LOGW(TAG, "Laitetta ei löytynyt: %s", addr_str);
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Device not found");
+        return ESP_FAIL;
+    }
+    
+    // Päivitä laitteen asetukset
+    strncpy(devices[target_idx].name, name, MAX_NAME_LEN - 1);
+    devices[target_idx].show_mac = (show_mac != 0);
+    devices[target_idx].field_mask = field_mask;
+    
+    // Tallenna asetukset
+    save_device_settings(devices[target_idx].addr, name, devices[target_idx].show_mac, field_mask);
+    
+    // Jos apply_to_similar on asetettu, etsi samanlaiset laitteet
+    int updated_count = 1;
+    if (apply_to_similar) {
+        uint16_t target_sig = get_device_signature(&devices[target_idx]);
+        ESP_LOGI(TAG, "Sovelletaan asetuksia samanlaisiin laitteisiin (signatuuri: 0x%04X)", target_sig);
+        
+        for (int i = 0; i < device_count; i++) {
+            if (i == target_idx) continue;
+            
+            uint16_t sig = get_device_signature(&devices[i]);
+            if (sig == target_sig) {
+                // Sovella vain show_mac ja field_mask, ei nimeä!
+                devices[i].show_mac = devices[target_idx].show_mac;
+                devices[i].field_mask = devices[target_idx].field_mask;
+                save_device_settings(devices[i].addr, devices[i].name, devices[i].show_mac, field_mask);
+                updated_count++;
+                ESP_LOGI(TAG, "  Päivitetty: %02X:%02X:...", devices[i].addr[0], devices[i].addr[1]);
+            }
+        }
+    }
+    
+    ESP_LOGI(TAG, "Päivitetty %d laitetta", updated_count);
+    
+    char response[128];
+    snprintf(response, sizeof(response), "{\"ok\":true,\"updated\":%d}", updated_count);
+    httpd_resp_sendstr(req, response);
+    return ESP_OK;
+}
+
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 8;
@@ -377,6 +649,14 @@ static void start_webserver(void) {
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_toggle_visibility);
+        
+        httpd_uri_t api_update_settings = {
+            .uri = "/api/update-settings",
+            .method = HTTP_POST,
+            .handler = api_update_settings_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_update_settings);
         
         ESP_LOGI(TAG, "HTTP-palvelin käynnistetty");
     }
