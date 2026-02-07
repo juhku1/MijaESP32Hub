@@ -6,23 +6,44 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
 #include "services/gap/ble_svc_gap.h"
+#include "esp_nimble_hci.h"
 #include <string.h>
 #include "ble_parser.h"
 #include "webserver.h"
+#include "setup_page.h"
 
 static const char *TAG = "BLE_SCAN";
 static const char *WIFI_TAG = "WiFi";
 
 #define MAX_DEVICES 50
-#define WIFI_SSID "Kontu"
-#define WIFI_PASS "8765432A1"
 #define MAX_NAME_LEN 32
 #define NVS_NAMESPACE "devices"
+#define NVS_CONFIG_NAMESPACE "config"
+#define AP_SSID "BLE_Monitor_Setup"
+#define AP_PASS "12345678"
+#define BOOT_BUTTON_GPIO GPIO_NUM_0
+#define RESET_HOLD_TIME_MS 5000
+
+// Laitteen rooli
+typedef enum {
+    ROLE_UNCONFIGURED = 0,
+    ROLE_SENSOR = 1,
+    ROLE_GATEWAY = 2
+} device_role_t;
+
+static device_role_t device_role = ROLE_UNCONFIGURED;
+static char wifi_ssid[32] = {0};
+static char wifi_password[64] = {0};
+static bool wifi_configured = false;
+static char gateway_ip[16] = {0};  // Sensorille: keskittimen IP-osoite
 
 typedef struct {
     uint8_t addr[6];
@@ -50,6 +71,119 @@ typedef struct {
 static ble_device_t devices[MAX_DEVICES];
 static int device_count = 0;
 static httpd_handle_t server = NULL;
+
+// Skannauksen hallinta
+// HUOM: Skannaus pyörii JATKUVASTI, mutta uusia laitteita lisätään vain discovery-moden aikana
+static bool allow_new_devices = false;  // Sallitaanko uusien laitteiden lisääminen (discovery mode)
+static esp_timer_handle_t discovery_timer = NULL;  // Ajastin discovery-moden lopettamiseen
+#define DISCOVERY_DURATION_MS 30000  // Discovery-moden kesto millisekunteina (30s)
+
+// === ASETUSTEN HALLINTA ===
+
+// Tallenna WiFi- ja rooliasetukset NVS:ään
+static void save_config_to_nvs(const char *ssid, const char *password, device_role_t role, const char *gw_ip) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_CONFIG_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_str(nvs, "wifi_ssid", ssid);
+        nvs_set_str(nvs, "wifi_pass", password);
+        nvs_set_u8(nvs, "role", (uint8_t)role);
+        if (gw_ip && strlen(gw_ip) > 0) {
+            nvs_set_str(nvs, "gateway_ip", gw_ip);
+        }
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Asetukset tallennettu: SSID=%s, Role=%d", ssid, role);
+    }
+}
+
+// Lataa asetukset NVS:stä
+static bool load_config_from_nvs(void) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_CONFIG_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        ESP_LOGI(TAG, "Ei tallennettuja asetuksia, käynnistetään AP-tila");
+        return false;
+    }
+    
+    size_t len;
+    
+    // SSID
+    len = sizeof(wifi_ssid);
+    if (nvs_get_str(nvs, "wifi_ssid", wifi_ssid, &len) != ESP_OK) {
+        nvs_close(nvs);
+        return false;
+    }
+    
+    // Password
+    len = sizeof(wifi_password);
+    if (nvs_get_str(nvs, "wifi_pass", wifi_password, &len) != ESP_OK) {
+        nvs_close(nvs);
+        return false;
+    }
+    
+    // Role
+    uint8_t role_val = 0;
+    if (nvs_get_u8(nvs, "role", &role_val) != ESP_OK) {
+        nvs_close(nvs);
+        return false;
+    }
+    device_role = (device_role_t)role_val;
+    
+    // Gateway IP (valinnainen, vain sensoreille)
+    len = sizeof(gateway_ip);
+    nvs_get_str(nvs, "gateway_ip", gateway_ip, &len);  // Ei haittaa jos ei löydy
+    
+    nvs_close(nvs);
+    ESP_LOGI(TAG, "Asetukset ladattu: SSID=%s, Role=%d, Gateway IP=%s", wifi_ssid, device_role, gateway_ip);
+    return true;
+}
+
+// Poista asetukset (factory reset)
+static void clear_config_from_nvs(void) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_CONFIG_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_erase_all(nvs);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Asetukset tyhjennetty");
+    }
+}
+
+// Tausta-task joka monitoroi BOOT-nappia tehdasasetusten palautusta varten
+static void button_monitor_task(void *pvParameters) {
+    // Konfiguroi GPIO0 inputiksi pull-up:lla
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << BOOT_BUTTON_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+    
+    ESP_LOGI(TAG, "BOOT-napin monitorointi käynnistetty (GPIO%d). Pidä pohjassa 5s nollataksesi asetukset.", BOOT_BUTTON_GPIO);
+    
+    while (1) {
+        // Tarkista onko nappi pohjassa (LOW = painettu)
+        if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+            ESP_LOGI(TAG, "BOOT-nappi painettu, odotetaan %d ms...", RESET_HOLD_TIME_MS);
+            
+            // Odota 5 sekuntia ja tarkista onko nappi yhä pohjassa
+            vTaskDelay(pdMS_TO_TICKS(RESET_HOLD_TIME_MS));
+            
+            if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+                ESP_LOGW(TAG, "*** BOOT-nappi pidetty 5s -> NOLLATAAN ASETUKSET! ***");
+                clear_config_from_nvs();
+                ESP_LOGI(TAG, "Käynnistetään uudelleen setup-tilaan...");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                esp_restart();
+            } else {
+                ESP_LOGI(TAG, "BOOT-nappi vapautettu, ei nollausta");
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(100));  // Tarkista nappia 10 kertaa sekunnissa
+    }
+}
 
 // Tallenna laitteen asetukset NVS:ään
 static void save_device_settings(uint8_t *addr, const char *name, bool show_mac, uint16_t field_mask) {
@@ -151,8 +285,75 @@ static bool load_visibility(uint8_t *addr) {
     return val ? true : false;
 }
 
+// Lataa kaikki NVS:ään tallennetut laitteet käynnistyksessä
+static void load_all_devices_from_nvs(void) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        ESP_LOGI(TAG, "NVS ei vielä ole käytössä tai ei laitteita");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Ladataan kaikki laitteet NVS:stä...");
+    
+    // Käy läpi kaikki NVS-avaimet
+    nvs_iterator_t it = NULL;
+    esp_err_t res = nvs_entry_find("nvs", NVS_NAMESPACE, NVS_TYPE_ANY, &it);
+    
+    while (res == ESP_OK && device_count < MAX_DEVICES) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+        
+        // Tarkistetaan onko tämä visibility-avain (12 hex-merkkiä ilman _-päätettä)
+        if (strlen(info.key) == 12) {
+            bool is_hex = true;
+            for (int i = 0; i < 12; i++) {
+                if (!((info.key[i] >= '0' && info.key[i] <= '9') ||
+                      (info.key[i] >= 'A' && info.key[i] <= 'F'))) {
+                    is_hex = false;
+                    break;
+                }
+            }
+            
+            if (is_hex) {
+                // Parsitaan MAC-osoite
+                uint8_t addr[6];
+                for (int i = 0; i < 6; i++) {
+                    char byte_str[3] = {info.key[i*2], info.key[i*2+1], 0};
+                    addr[5-i] = (uint8_t)strtol(byte_str, NULL, 16);
+                }
+                
+                // Lisää laite listaan
+                memcpy(devices[device_count].addr, addr, 6);
+                devices[device_count].visible = load_visibility(addr);
+                devices[device_count].rssi = 0;
+                devices[device_count].last_seen = 0;
+                devices[device_count].has_sensor_data = false;
+                
+                // Lataa muut asetukset
+                load_device_settings(addr, devices[device_count].name,
+                                   &devices[device_count].show_mac,
+                                   &devices[device_count].field_mask);
+                
+                ESP_LOGI(TAG, "  Ladattu laite %d: %02X:%02X:%02X:%02X:%02X:%02X, name=%s",
+                        device_count,
+                        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
+                        devices[device_count].name);
+                
+                device_count++;
+            }
+        }
+        
+        res = nvs_entry_next(&it);
+    }
+    
+    nvs_release_iterator(it);
+    nvs_close(nvs);
+    
+    ESP_LOGI(TAG, "Ladattu yhteensä %d laitetta NVS:stä", device_count);
+}
 
-static int find_or_add_device(uint8_t *addr) {
+
+static int find_or_add_device(uint8_t *addr, bool allow_adding_new) {
     // Etsi onko laite jo listassa
     for (int i = 0; i < device_count; i++) {
         if (memcmp(devices[i].addr, addr, 6) == 0) {
@@ -160,20 +361,30 @@ static int find_or_add_device(uint8_t *addr) {
         }
     }
     
-    // Lisää uusi laite
+    // Lisää uusi laite vain jos sallittu (discovery mode päällä)
+    if (!allow_adding_new) {
+        return -1;  // Ei lisätä uusia laitteita monitoring-moden aikana
+    }
+    
+    // Lisää uusi laite - oletuksena NÄKYVISSÄ
     if (device_count < MAX_DEVICES) {
         memcpy(devices[device_count].addr, addr, 6);
-        devices[device_count].visible = load_visibility(addr);
+        devices[device_count].visible = true;  // AINA näkyvissä aluksi
+        devices[device_count].rssi = 0;
+        devices[device_count].last_seen = 0;
+        devices[device_count].has_sensor_data = false;
         
-        // Lataa muut asetukset
+        // Lataa tallennetut asetukset (nimi, show_mac, field_mask)
         load_device_settings(addr, devices[device_count].name, 
                            &devices[device_count].show_mac,
                            &devices[device_count].field_mask);
         
-        devices[device_count].has_sensor_data = false;
-        ESP_LOGI(TAG, "Uusi laite löydetty: name=%s, show_mac=%d, fields=0x%04X",
-                 devices[device_count].name, devices[device_count].show_mac,
-                 devices[device_count].field_mask);
+        // Lataa vain visibility erikseen
+        devices[device_count].visible = load_visibility(addr);
+        
+        ESP_LOGI(TAG, "Uusi laite löydetty: %02X:%02X:%02X:%02X:%02X:%02X, name=%s, visible=%d",
+                 addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
+                 devices[device_count].name, devices[device_count].visible);
         return device_count++;
     }
     return -1;
@@ -181,7 +392,8 @@ static int find_or_add_device(uint8_t *addr) {
 
 static int ble_gap_event(struct ble_gap_event *event, void *arg) {
     if (event->type == BLE_GAP_EVENT_DISC) {
-        int idx = find_or_add_device(event->disc.addr.val);
+        // Päivitä olemassa olevia AINA, lisää uusia vain discovery-moden aikana
+        int idx = find_or_add_device(event->disc.addr.val, allow_new_devices);
         if (idx >= 0) {
             devices[idx].rssi = event->disc.rssi;
             devices[idx].last_seen = xTaskGetTickCount();
@@ -231,12 +443,37 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
     return 0;
 }
 
+// Timer callback: Lopettaa discovery moden (uusien laitteiden etsinnän)
+// Skannaus jatkuu edelleen olemassa olevien laitteiden arvojen päivittämiseksi
+static void stop_discovery_timer_callback(void* arg) {
+    ESP_LOGI(TAG, "Discovery-ajastin laukesi, lopetetaan uusien laitteiden etsintä");
+    ESP_LOGI(TAG, "Skannaus JATKUU olemassa olevien laitteiden arvojen päivittämiseksi");
+    allow_new_devices = false;
+}
+
+// BLE-stack valmis, käynnistetään jatkuva skannaus
 static void ble_app_on_sync(void) {
+    ESP_LOGI(TAG, "BLE-stack synkronoitu ja valmis");
+    
+    if (device_role == ROLE_SENSOR) {
+        ESP_LOGI(TAG, "SENSORI-tila: Käynnistetään skannaus ja lähetetään data keskittimelle (%s)", gateway_ip);
+    } else {
+        ESP_LOGI(TAG, "KESKITIN-tila: Käynnistetään skannaus ja kerätään data");
+    }
+    
+    // Käynnistä jatkuva skannaus
     struct ble_gap_disc_params disc_params = {0};
     disc_params.itvl = 0x10;
     disc_params.window = 0x10;
     disc_params.passive = 0;  // Active scan jotta saadaan scan response (nimi)
-    ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params, ble_gap_event, NULL);
+    
+    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params, ble_gap_event, NULL);
+    
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Jatkuvan skannauksen käynnistys epäonnistui: %d", rc);
+    } else {
+        ESP_LOGI(TAG, "✓ Jatkuva skannaus käynnissä");
+    }
 }
 
 static void host_task(void *param) {
@@ -254,11 +491,48 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(WIFI_TAG, "✓ Yhdistetty! IP-osoite: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(WIFI_TAG, "Avaa selaimessa: http://" IPSTR, IP2STR(&event->ip_info.ip));
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t* ev = (wifi_event_ap_staconnected_t*) event_data;
+        ESP_LOGI(WIFI_TAG, "Laite yhdistetty AP:hen, MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+                 ev->mac[0], ev->mac[1], ev->mac[2], ev->mac[3], ev->mac[4], ev->mac[5]);
     }
 }
 
-static void wifi_init(void) {
-    ESP_LOGI(WIFI_TAG, "Alustetaan WiFi...");
+// Käynnistä WiFi AP-tilassa (setup mode)
+static void wifi_init_ap(void) {
+    ESP_LOGI(WIFI_TAG, "Käynnistetään AP-tila: %s", AP_SSID);
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = AP_SSID,
+            .password = AP_PASS,
+            .ssid_len = strlen(AP_SSID),
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA2_PSK
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    ESP_LOGI(WIFI_TAG, "✓ AP-tila käynnissä");
+    ESP_LOGI(WIFI_TAG, "Yhdistä verkkoon: %s (salasana: %s)", AP_SSID, AP_PASS);
+    ESP_LOGI(WIFI_TAG, "Avaa selain osoitteessa: http://192.168.4.1");
+}
+
+// Käynnistä WiFi STA-tilassa (normaali käyttö)
+static void wifi_init_sta(void) {
+    ESP_LOGI(WIFI_TAG, "Alustetaan WiFi STA-tila...");
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -271,14 +545,11 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-        },
-    };
+    wifi_config_t wifi_config = {0};
+    memcpy(wifi_config.sta.ssid, wifi_ssid, sizeof(wifi_config.sta.ssid));
+    memcpy(wifi_config.sta.password, wifi_password, sizeof(wifi_config.sta.password));
     
-    ESP_LOGI(WIFI_TAG, "Yhdistetään verkkoon: %s", WIFI_SSID);
+    ESP_LOGI(WIFI_TAG, "Yhdistetään verkkoon: %s", wifi_ssid);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -288,8 +559,164 @@ static void wifi_init(void) {
 // WEB-KÄYTTÖLIITTYMÄ
 // ============================================
 
+// Setup-sivu (AP-tilassa)
+static esp_err_t setup_get_handler(httpd_req_t *req) {
+    httpd_resp_send(req, SETUP_HTML_PAGE, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Normaali pääsivu (STA-tilassa)
 static esp_err_t root_get_handler(httpd_req_t *req) {
     httpd_resp_send(req, HTML_PAGE, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// API: Tallenna setup-asetukset ja käynnistä uudelleen
+static esp_err_t api_setup_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_type(req, "application/json");
+    
+    char buf[512];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Ei dataa\"}");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    // Parsitaan JSON (yksinkertainen käsittely)
+    char ssid[32] = {0};
+    char password[64] = {0};
+    char gateway_ip_str[16] = {0};
+    int role = 0;
+    
+    // Etsi SSID
+    char *ssid_start = strstr(buf, "\"ssid\":\"");
+    if (ssid_start) {
+        ssid_start += 8;
+        char *ssid_end = strchr(ssid_start, '"');
+        if (ssid_end) {
+            int len = ssid_end - ssid_start;
+            if (len < sizeof(ssid)) {
+                strncpy(ssid, ssid_start, len);
+            }
+        }
+    }
+    
+    // Etsi password
+    char *pass_start = strstr(buf, "\"password\":\"");
+    if (pass_start) {
+        pass_start += 12;
+        char *pass_end = strchr(pass_start, '"');
+        if (pass_end) {
+            int len = pass_end - pass_start;
+            if (len < sizeof(password)) {
+                strncpy(password, pass_start, len);
+            }
+        }
+    }
+    
+    // Etsi role
+    char *role_start = strstr(buf, "\"role\":");
+    if (role_start) {
+        role_start += 7;
+        role = atoi(role_start);
+    }
+    
+    // Etsi gateway_ip (valinnainen)
+    char *gw_start = strstr(buf, "\"gateway_ip\":\"");
+    if (gw_start) {
+        gw_start += 14;
+        char *gw_end = strchr(gw_start, '"');
+        if (gw_end) {
+            int len = gw_end - gw_start;
+            if (len < sizeof(gateway_ip_str)) {
+                strncpy(gateway_ip_str, gw_start, len);
+            }
+        }
+    }
+    
+    ESP_LOGI(TAG, "Setup: SSID=%s, Role=%d, GW IP=%s", ssid, role, gateway_ip_str);
+    
+    // Validointi
+    if (strlen(ssid) == 0 || strlen(password) == 0 || (role != 1 && role != 2)) {
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Virheelliset tiedot\"}");
+        return ESP_FAIL;
+    }
+    
+    // Tallenna
+    save_config_to_nvs(ssid, password, (device_role_t)role, gateway_ip_str);
+    
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    
+    // Käynnistä uudelleen 2 sekunnin kuluttua
+    ESP_LOGI(TAG, "Asetukset tallennettu, käynnistetään uudelleen...");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+    
+    return ESP_OK;
+}
+
+// API: Käynnistä discovery mode (uusien laitteiden etsintä) 30 sekunniksi
+// HUOM: Skannaus pyörii jo jatkuvasti, tämä vain sallii uusien laitteiden lisäämisen
+static esp_err_t api_start_scan_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_type(req, "application/json");
+    
+    if (allow_new_devices) {
+        ESP_LOGW(TAG, "Discovery mode on jo käynnissä");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Discovery mode jo käynnissä\"}");
+        return ESP_OK;
+    }
+    
+    ESP_LOGI(TAG, "Käynnistetään DISCOVERY MODE %d sekunnin ajaksi (skannaus pyörii jo taustalla)", DISCOVERY_DURATION_MS / 1000);
+    
+    // Salli uusien laitteiden lisääminen
+    allow_new_devices = true;
+    
+    // Luo ajastin jos ei vielä ole
+    if (discovery_timer == NULL) {
+        esp_timer_create_args_t timer_args = {
+            .callback = stop_discovery_timer_callback,
+            .name = "discovery_timer"
+        };
+        esp_timer_create(&timer_args, &discovery_timer);
+    }
+    
+    // Käynnistä ajastin
+    esp_timer_start_once(discovery_timer, DISCOVERY_DURATION_MS * 1000);  // Microsekunteja
+    
+    char response[128];
+    snprintf(response, sizeof(response), "{\"ok\":true,\"duration\":%d}", DISCOVERY_DURATION_MS / 1000);
+    httpd_resp_sendstr(req, response);
+    return ESP_OK;
+}
+
+// API: Vastaanota sensorin lähettämä data (VAIN KESKITTIMELLÄ)
+static esp_err_t api_sensor_data_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_type(req, "application/json");
+    
+    // Tarkista että ollaan keskitin
+    if (device_role != ROLE_GATEWAY) {
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Ei keskitin\"}");
+        return ESP_FAIL;
+    }
+    
+    char buf[2048];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Ei dataa\"}");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    ESP_LOGI(TAG, "Vastaanotettu sensoridataa: %s", buf);
+    
+    // TODO: Parsitaan JSON ja lisätään/päivitetään laitteita
+    // Tämä toteutetaan myöhemmin kun tarvitaan
+    
+    httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
 }
 
@@ -622,10 +1049,34 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 10;
     config.stack_size = 8192;
     
     if (httpd_start(&server, &config) == ESP_OK) {
+        
+        // Setup-tila (AP): vain setup-sivu ja API
+        if (device_role == ROLE_UNCONFIGURED) {
+            httpd_uri_t root = {
+                .uri = "/",
+                .method = HTTP_GET,
+                .handler = setup_get_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(server, &root);
+            
+            httpd_uri_t api_setup = {
+                .uri = "/api/setup",
+                .method = HTTP_POST,
+                .handler = api_setup_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(server, &api_setup);
+            
+            ESP_LOGI(TAG, "HTTP-palvelin käynnistetty (SETUP-tila)");
+            return;
+        }
+        
+        // Normaali tila: kaikki endpointit
         httpd_uri_t root = {
             .uri = "/",
             .method = HTTP_GET,
@@ -641,6 +1092,17 @@ static void start_webserver(void) {
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_devices);
+        
+        // Vastaanota sensorien lähettämä data (vain keskittimelle)
+        if (device_role == ROLE_GATEWAY) {
+            httpd_uri_t api_sensor_data = {
+                .uri = "/api/sensor-data",
+                .method = HTTP_POST,
+                .handler = api_sensor_data_handler,
+                .user_ctx = NULL
+            };
+            httpd_register_uri_handler(server, &api_sensor_data);
+        }
         
         httpd_uri_t api_toggle_visibility = {
             .uri = "/api/toggle-visibility",
@@ -658,13 +1120,22 @@ static void start_webserver(void) {
         };
         httpd_register_uri_handler(server, &api_update_settings);
         
-        ESP_LOGI(TAG, "HTTP-palvelin käynnistetty");
+        httpd_uri_t api_start_scan = {
+            .uri = "/api/start-scan",
+            .method = HTTP_POST,
+            .handler = api_start_scan_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_start_scan);
+        
+        ESP_LOGI(TAG, "HTTP-palvelin käynnistetty (normaali tila)");
     }
 }
 
 void app_main() {
-    ESP_LOGI(TAG, "BLE Scanner + Web UI käynnistyy");
+    ESP_LOGI(TAG, "=== BLE Live Monitor käynnistyy ===");
     
+    // NVS alustus
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -672,15 +1143,44 @@ void app_main() {
     }
     ESP_ERROR_CHECK(ret);
     
-    nvs_handle_t nvs;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
-        nvs_close(nvs);
+    // Käynnistä BOOT-napin monitorointi taustalle
+    xTaskCreate(button_monitor_task, "button_monitor", 2048, NULL, 5, NULL);
+    
+    // Lataa asetukset NVS:stä
+    wifi_configured = load_config_from_nvs();
+    
+    if (!wifi_configured) {
+        // Ei asetuksia -> AP-tila (setup mode)
+        ESP_LOGI(TAG, "Ei tallennettuja asetuksia -> Käynnistetään SETUP-tila");
+        device_role = ROLE_UNCONFIGURED;
+        wifi_init_ap();
+        start_webserver();
+        ESP_LOGI(TAG, "Yhdistä verkkoon '%s' ja avaa http://192.168.4.1", AP_SSID);
+        return;
     }
     
-    wifi_init();
+    // Asetukset löytyivät -> normaali käyttö
+    ESP_LOGI(TAG, "Asetukset löytyivät -> Rooli: %s", 
+             device_role == ROLE_GATEWAY ? "KESKITIN" : "SENSORI");
+    
+    // Lataa tallennetut laitteet (vain keskittimellä)
+    if (device_role == ROLE_GATEWAY) {
+        load_all_devices_from_nvs();
+    }
+    
+    // WiFi-yhteys
+    wifi_init_sta();
+    
+    // Web-palvelin
     start_webserver();
     
+    // BLE-stack käynnistys (molemmat roolit skannaavat)
+    ESP_LOGI(TAG, "Käynnistetään BLE-stack...");
     nimble_port_init();
     ble_hs_cfg.sync_cb = ble_app_on_sync;
+    ble_svc_gap_device_name_set("BLE Monitor");
     nimble_port_freertos_init(host_task);
+    
+    ESP_LOGI(TAG, "=== Käynnistys valmis ===");
 }
+
