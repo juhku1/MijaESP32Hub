@@ -239,10 +239,10 @@ static int find_or_add_device(uint8_t *addr, bool allow_adding_new) {
         return -1;  // Ei lisätä uusia laitteita monitoring-moden aikana
     }
     
-    // Lisää uusi laite - oletuksena NÄKYVISSÄ
+    // Lisää uusi laite - oletuksena PIILOTETTU (näkyy vain discovery-popupissa)
     if (device_count < MAX_DEVICES) {
         memcpy(devices[device_count].addr, addr, 6);
-        devices[device_count].visible = true;  // AINA näkyvissä aluksi
+        devices[device_count].visible = false;  // Piilotettu kunnes käyttäjä lisää päänäkymään
         devices[device_count].rssi = 0;
         devices[device_count].last_seen = 0;
         devices[device_count].has_sensor_data = false;
@@ -252,7 +252,7 @@ static int find_or_add_device(uint8_t *addr, bool allow_adding_new) {
                            &devices[device_count].show_mac,
                            &devices[device_count].field_mask);
         
-        // Lataa vain visibility erikseen
+        // Lataa visibility NVS:stä (jos tallennettu)
         devices[device_count].visible = load_visibility(addr);
         
         ESP_LOGI(TAG, "Uusi laite löydetty: %02X:%02X:%02X:%02X:%02X:%02X, name=%s, visible=%d",
@@ -460,9 +460,8 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
     bool first = true;
     
     for (int i = 0; i < device_count; i++) {
-        // Näytä vain näkyvät laitteet (paitsi jos show_all=true)
+        // Oletuksena vain visible=true, show_all=1 näyttää kaikki (discovery-popup)
         if (!show_all && !devices[i].visible) {
-            ESP_LOGI(TAG, "Laite %d piilotettu, ohitetaan", i);
             continue;
         }
         
@@ -484,7 +483,7 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
             snprintf(item, sizeof(item),
                 "%s{\"addr\":\"%s\",\"name\":\"%s\",\"rssi\":%d,"
                 "\"hasSensor\":true,\"temp\":%.1f,\"hum\":%d,\"bat\":%d,\"batMv\":%d,"
-                "\"visible\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
+                "\"saved\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
                 first ? "" : ",",
                 addr_str,
                 devices[i].name[0] ? devices[i].name : "Unknown",
@@ -500,7 +499,7 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
         } else {
             snprintf(item, sizeof(item),
                 "%s{\"addr\":\"%s\",\"name\":\"%s\",\"rssi\":%d,"
-                "\"hasSensor\":false,\"visible\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
+                "\"hasSensor\":false,\"saved\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
                 first ? "" : ",",
                 addr_str,
                 devices[i].name[0] ? devices[i].name : "Unknown",
@@ -813,10 +812,7 @@ static void start_webserver(void) {
 void app_main() {
     ESP_LOGI(TAG, "BLE Scanner + Web UI käynnistyy");
     
-    // TYHJENNÄ NVS KOKONAAN - aloitetaan puhtaalta pöydältä
-    ESP_LOGI(TAG, "Tyhjennetään NVS...");
-    nvs_flash_erase();
-    
+    // NVS alustus
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -829,9 +825,9 @@ void app_main() {
         nvs_close(nvs);
     }
     
-    // EI ladata vanhoja laitteita - aloitetaan tyhjästä
-    device_count = 0;
-    ESP_LOGI(TAG, "Aloitetaan tyhjällä laitelistalla");
+    // Lataa tallennetut laitteet NVS:stä
+    load_all_devices_from_nvs();
+    ESP_LOGI(TAG, "Ladattu %d tallennettua laitetta NVS:stä", device_count);
     
     wifi_init();
     start_webserver();
