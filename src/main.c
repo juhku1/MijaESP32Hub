@@ -142,7 +142,7 @@ static void save_visibility(uint8_t *addr, bool visible) {
 }
 static bool load_visibility(uint8_t *addr) {
     nvs_handle_t nvs;
-    uint8_t val = 1;  // Oletuksena näkyvissä
+    uint8_t val = 0;  // Oletuksena PIILOTETTU (ei ole vielä valittu päänäkymään)
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
         char key[20];
         snprintf(key, sizeof(key), "%02X%02X%02X%02X%02X%02X",
@@ -151,7 +151,7 @@ static bool load_visibility(uint8_t *addr) {
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "NVS ladattu: %s -> visible=%d", key, val);
         } else {
-            ESP_LOGI(TAG, "NVS: %s ei löytynyt (err=%d), oletusarvo visible=1", key, err);
+            ESP_LOGI(TAG, "NVS: %s ei löytynyt (err=%d), oletusarvo visible=0", key, err);
         }
         nvs_close(nvs);
     }
@@ -265,8 +265,15 @@ static int find_or_add_device(uint8_t *addr, bool allow_adding_new) {
 
 static int ble_gap_event(struct ble_gap_event *event, void *arg) {
     if (event->type == BLE_GAP_EVENT_DISC) {
-        // Päivitä olemassa olevia AINA, lisää uusia vain discovery-moden aikana
+        // Discovery mode: lisää uusia + päivitä kaikkia
+        // Monitoring mode: päivitä vain visible=true laitteita
         int idx = find_or_add_device(event->disc.addr.val, allow_new_devices);
+        
+        // Jos laite ei ole listassa tai ei ole näkyvissä (ja ei olla discovery-modessa), ohita
+        if (idx < 0 || (!allow_new_devices && !devices[idx].visible)) {
+            return 0;  // Ei päivitetä piilotettuja laitteita monitoring-modessa
+        }
+        
         if (idx >= 0) {
             devices[idx].rssi = event->disc.rssi;
             devices[idx].last_seen = xTaskGetTickCount();
