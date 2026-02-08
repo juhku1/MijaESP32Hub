@@ -7,6 +7,7 @@
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_timer.h"
+#include "driver/gpio.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -15,16 +16,18 @@
 #include <string.h>
 #include "ble_parser.h"
 #include "webserver.h"
+#include "setup_page.h"
 
 static const char *TAG = "BLE_SCAN";
 static const char *WIFI_TAG = "WiFi";
 
 #define MAX_DEVICES 50
-#define WIFI_SSID "Kontu"
-#define WIFI_PASS "8765432A1"
 #define MAX_NAME_LEN 32
 #define NVS_NAMESPACE "devices"
+#define NVS_WIFI_NAMESPACE "wifi"
 
+#define BOOT_BUTTON_GPIO 0
+#define BOOT_HOLD_TIME_MS 5000
 typedef struct {
     uint8_t addr[6];
     int8_t rssi;
@@ -51,6 +54,9 @@ typedef struct {
 static ble_device_t devices[MAX_DEVICES];
 static int device_count = 0;
 static httpd_handle_t server = NULL;
+static bool setup_mode = false;
+static char wifi_ssid[64] = {0};
+static char wifi_password[64] = {0};
 
 // Skannauksen hallinta
 // HUOM: Skannaus pyörii JATKUVASTI, mutta uusia laitteita lisätään vain discovery-moden aikana
@@ -369,31 +375,136 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     }
 }
 
+// WiFi NVS -funktiot
+static bool load_wifi_config(void) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        ESP_LOGW(WIFI_TAG, "WiFi-asetuksia ei löydy NVS:stä");
+        return false;
+    }
+    
+    size_t ssid_len = sizeof(wifi_ssid);
+    size_t pass_len = sizeof(wifi_password);
+    
+    esp_err_t err_ssid = nvs_get_str(nvs, "ssid", wifi_ssid, &ssid_len);
+    esp_err_t err_pass = nvs_get_str(nvs, "password", wifi_password, &pass_len);
+    
+    nvs_close(nvs);
+    
+    if (err_ssid == ESP_OK && err_pass == ESP_OK && strlen(wifi_ssid) > 0) {
+        ESP_LOGI(WIFI_TAG, "WiFi-asetukset ladattu: %s", wifi_ssid);
+        return true;
+    }
+    
+    return false;
+}
+
+static void save_wifi_config(const char* ssid, const char* password) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGE(WIFI_TAG, "NVS:n avaus epäonnistui");
+        return;
+    }
+    
+    nvs_set_str(nvs, "ssid", ssid);
+    nvs_set_str(nvs, "password", password);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    
+    ESP_LOGI(WIFI_TAG, "WiFi-asetukset tallennettu");
+}
+
+static void clear_wifi_config(void) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_erase_all(nvs);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(WIFI_TAG, "WiFi-asetukset nollattu");
+    }
+}
+
+static void check_boot_button(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << BOOT_BUTTON_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+    
+    if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+        ESP_LOGI(WIFI_TAG, "BOOT-nappi pohjassa, tarkistetaan...");
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        uint32_t start = esp_timer_get_time() / 1000;
+        while (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+            uint32_t elapsed = (esp_timer_get_time() / 1000) - start;
+            if (elapsed >= BOOT_HOLD_TIME_MS) {
+                ESP_LOGW(WIFI_TAG, "🔄 BOOT-nappi pidetty 5s - Nollataan WiFi!");
+                clear_wifi_config();
+                vTaskDelay(pdMS_TO_TICKS(500));
+                esp_restart();
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        ESP_LOGI(WIFI_TAG, "BOOT-nappi vapautettu liian aikaisin");
+    }
+}
+
 static void wifi_init(void) {
-    ESP_LOGI(WIFI_TAG, "Alustetaan WiFi...");
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
+    
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
+    
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-        },
-    };
     
-    ESP_LOGI(WIFI_TAG, "Yhdistetään verkkoon: %s", WIFI_SSID);
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    // Tarkista onko WiFi määritetty
+    if (!load_wifi_config()) {
+        // EI WiFi-asetuksia -> AP-tila
+        ESP_LOGI(WIFI_TAG, "🔧 Setup-tila: Käynnistetään AP-tila");
+        setup_mode = true;
+        
+        esp_netif_create_default_wifi_ap();
+        
+        wifi_config_t ap_config = {
+            .ap = {
+                .ssid = "BLE-Monitor-Setup",
+                .ssid_len = strlen("BLE-Monitor-Setup"),
+                .channel = 1,
+                .password = "",
+                .max_connection = 4,
+                .authmode = WIFI_AUTH_OPEN,
+            },
+        };
+        
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+        ESP_ERROR_CHECK(esp_wifi_start());
+        
+        ESP_LOGI(WIFI_TAG, "✓ AP käynnistetty: BLE-Monitor-Setup");
+        ESP_LOGI(WIFI_TAG, "Avaa selaimessa: http://192.168.4.1");
+    } else {
+        // WiFi määritetty -> STA-tila
+        ESP_LOGI(WIFI_TAG, "Yhdistetään verkkoon: %s", wifi_ssid);
+        setup_mode = false;
+        
+        esp_netif_create_default_wifi_sta();
+        
+        wifi_config_t wifi_config = {0};
+        strncpy((char*)wifi_config.sta.ssid, wifi_ssid, sizeof(wifi_config.sta.ssid));
+        strncpy((char*)wifi_config.sta.password, wifi_password, sizeof(wifi_config.sta.password));
+        
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+        ESP_ERROR_CHECK(esp_wifi_start());
+    }
 }
 
 // ============================================
@@ -401,7 +512,72 @@ static void wifi_init(void) {
 // ============================================
 
 static esp_err_t root_get_handler(httpd_req_t *req) {
-    httpd_resp_send(req, HTML_PAGE, HTTPD_RESP_USE_STRLEN);
+    if (setup_mode) {
+        httpd_resp_send(req, SETUP_HTML_PAGE, HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_send(req, HTML_PAGE, HTTPD_RESP_USE_STRLEN);
+    }
+    return ESP_OK;
+}
+
+// API: Setup WiFi-asetukset
+static esp_err_t api_setup_handler(httpd_req_t *req) {
+    char buf[256];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    // Parseroidaan JSON (yksinkertainen toteutus)
+    char *ssid_start = strstr(buf, "\"ssid\":\"");
+    char *pass_start = strstr(buf, "\"password\":\"");
+    
+    if (!ssid_start || !pass_start) {
+        const char* resp = "{\"ok\":false,\"error\":\"Invalid JSON\"}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    ssid_start += 8;  // Skip "ssid":"
+    pass_start += 12; // Skip "password":"
+    
+    char ssid[64] = {0};
+    char password[64] = {0};
+    
+    char *ssid_end = strchr(ssid_start, '"');
+    char *pass_end = strchr(pass_start, '"');
+    
+    if (ssid_end && pass_end) {
+        int ssid_len = ssid_end - ssid_start;
+        int pass_len = pass_end - pass_start;
+        
+        if (ssid_len > 0 && ssid_len < 64) {
+            strncpy(ssid, ssid_start, ssid_len);
+        }
+        if (pass_len >= 0 && pass_len < 64) {
+            strncpy(password, pass_start, pass_len);
+        }
+        
+        // Tallenna ja käynnistä uudelleen
+        save_wifi_config(ssid, password);
+        
+        const char* resp = "{\"ok\":true}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        
+        ESP_LOGI(WIFI_TAG, "WiFi määritelty, käynnistetään uudelleen...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+        
+        return ESP_OK;
+    }
+    
+    const char* resp = "{\"ok\":false,\"error\":\"Parse error\"}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -812,6 +988,14 @@ static void start_webserver(void) {
         };
         httpd_register_uri_handler(server, &api_start_scan);
         
+        httpd_uri_t api_setup = {
+            .uri = "/api/setup",
+            .method = HTTP_POST,
+            .handler = api_setup_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_setup);
+        
         ESP_LOGI(TAG, "HTTP-palvelin käynnistetty");
     }
 }
@@ -832,6 +1016,9 @@ void app_main() {
         nvs_close(nvs);
     }
     
+    // Tarkista BOOT-nappi WiFi-nollausta varten
+    check_boot_button();
+    
     // Lataa tallennetut laitteet NVS:stä
     load_all_devices_from_nvs();
     ESP_LOGI(TAG, "Ladattu %d tallennettua laitetta NVS:stä", device_count);
@@ -839,10 +1026,15 @@ void app_main() {
     wifi_init();
     start_webserver();
     
-    // Käynnistä BLE-stack, mutta EI aloita skannausta automaattisesti
-    nimble_port_init();
-    ble_hs_cfg.sync_cb = ble_app_on_sync;
-    nimble_port_freertos_init(host_task);
-    
-    ESP_LOGI(TAG, "Järjestelmä valmis. Skannaus odottaa käyttäjän komentoa.");
+    // BLE vain normaalitilassa, ei setup-modessa
+    if (!setup_mode) {
+        // Käynnistä BLE-stack, mutta EI aloita skannausta automaattisesti
+        nimble_port_init();
+        ble_hs_cfg.sync_cb = ble_app_on_sync;
+        nimble_port_freertos_init(host_task);
+        
+        ESP_LOGI(TAG, "Järjestelmä valmis. Skannaus odottaa käyttäjän komentoa.");
+    } else {
+        ESP_LOGI(TAG, "Setup-tila aktiivinen. BLE ei käytössä.");
+    }
 }
