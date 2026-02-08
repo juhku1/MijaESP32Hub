@@ -65,6 +65,7 @@ static char wifi_password[64] = {0};
 static char aio_username[64] = {0};
 static char aio_key[128] = {0};
 static bool aio_enabled = false;
+static uint8_t aio_feed_types = FIELD_TEMP | FIELD_HUM;  // Oletuksena temp + hum
 static esp_timer_handle_t aio_timer = NULL;
 
 // Skannauksen hallinta
@@ -477,19 +478,21 @@ static bool load_aio_config(void) {
     esp_err_t err_user = nvs_get_str(nvs, "username", aio_username, &user_len);
     esp_err_t err_key = nvs_get_str(nvs, "key", aio_key, &key_len);
     nvs_get_u8(nvs, "enabled", &enabled);
+    nvs_get_u8(nvs, "feed_types", &aio_feed_types);
     
     nvs_close(nvs);
     
     if (err_user == ESP_OK && err_key == ESP_OK && strlen(aio_username) > 0 && strlen(aio_key) > 0) {
         aio_enabled = (enabled != 0);
-        ESP_LOGI(AIO_TAG, "Asetukset ladattu: %s, enabled=%d", aio_username, aio_enabled);
+        if (aio_feed_types == 0) aio_feed_types = FIELD_TEMP | FIELD_HUM;  // Oletusarvo
+        ESP_LOGI(AIO_TAG, "Asetukset ladattu: %s, enabled=%d, types=0x%02x", aio_username, aio_enabled, aio_feed_types);
         return true;
     }
     
     return false;
 }
 
-static void save_aio_config(const char* username, const char* key, bool enabled) {
+static void save_aio_config(const char* username, const char* key, bool enabled, uint8_t feed_types) {
     nvs_handle_t nvs;
     if (nvs_open(NVS_AIO_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
         ESP_LOGE(AIO_TAG, "NVS:n avaus epäonnistui");
@@ -499,14 +502,16 @@ static void save_aio_config(const char* username, const char* key, bool enabled)
     nvs_set_str(nvs, "username", username);
     nvs_set_str(nvs, "key", key);
     nvs_set_u8(nvs, "enabled", enabled ? 1 : 0);
+    nvs_set_u8(nvs, "feed_types", feed_types);
     nvs_commit(nvs);
     nvs_close(nvs);
     
     strncpy(aio_username, username, sizeof(aio_username) - 1);
     strncpy(aio_key, key, sizeof(aio_key) - 1);
     aio_enabled = enabled;
+    aio_feed_types = feed_types;
     
-    ESP_LOGI(AIO_TAG, "Asetukset tallennettu");
+    ESP_LOGI(AIO_TAG, "Asetukset tallennettu, types=0x%02x", feed_types);
 }
 
 static void wifi_init(void) {
@@ -607,7 +612,7 @@ static void send_device_to_aio(const ble_device_t *dev) {
     }
     
     // Lähetä lämpötila
-    if (dev->field_mask & FIELD_TEMP) {
+    if ((dev->field_mask & FIELD_TEMP) && (aio_feed_types & FIELD_TEMP)) {
         char feed_name[80];
         snprintf(feed_name, sizeof(feed_name), "%s-temp", feed_key);
         snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds/%s/data", aio_username, feed_name);
@@ -646,7 +651,7 @@ static void send_device_to_aio(const ble_device_t *dev) {
     }
     
     // Lähetä kosteus
-    if (dev->field_mask & FIELD_HUM) {
+    if ((dev->field_mask & FIELD_HUM) && (aio_feed_types & FIELD_HUM)) {
         snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds/%s-hum/data", aio_username, feed_key);
         
         if (strlen(dev->name) > 0) {
@@ -682,7 +687,7 @@ static void send_device_to_aio(const ble_device_t *dev) {
     }
     
     // Lähetä akun taso
-    if (dev->field_mask & FIELD_BAT) {
+    if ((dev->field_mask & FIELD_BAT) && (aio_feed_types & FIELD_BAT)) {
         snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds/%s-bat/data", aio_username, feed_key);
         
         if (strlen(dev->name) > 0) {
@@ -735,6 +740,234 @@ static void aio_timer_callback(void* arg) {
     
     // Luo taski joka lähettää datan (ei blokoi timeria)
     xTaskCreate(aio_upload_task, "aio_upload", 8192, NULL, 5, NULL);
+}
+
+// API: Luo feedit automaattisesti
+static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    
+    if (strlen(aio_username) == 0 || strlen(aio_key) == 0) {
+        const char* resp = "{\"ok\":false,\"error\":\"Adafruit IO ei määritetty\"}";
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    char *response = malloc(4096);
+    if (!response) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    
+    strcpy(response, "{\"ok\":true,\"feeds\":[");
+    int created = 0;
+    
+    for (int i = 0; i < device_count; i++) {
+        if (!devices[i].visible || !devices[i].has_sensor_data) continue;
+        
+        // Generoi feed key
+        char feed_key[64];
+        char mac_str[20];
+        snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
+                 devices[i].addr[0], devices[i].addr[1], devices[i].addr[2], 
+                 devices[i].addr[3], devices[i].addr[4], devices[i].addr[5]);
+        
+        if (strlen(devices[i].name) > 0) {
+            char safe_name[MAX_NAME_LEN];
+            int j = 0;
+            char prev = '\0';
+            for (int k = 0; k < strlen(devices[i].name) && j < sizeof(safe_name) - 1; k++) {
+                char c = devices[i].name[k];
+                if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+                    safe_name[j++] = c;
+                    prev = c;
+                } else if (c >= 'A' && c <= 'Z') {
+                    safe_name[j++] = c + 32;
+                    prev = c + 32;
+                } else if (c == ' ' || c == '_' || c == '-') {
+                    if (prev != '-' && j > 0) {
+                        safe_name[j++] = '-';
+                        prev = '-';
+                    }
+                }
+            }
+            safe_name[j] = '\0';
+            snprintf(feed_key, sizeof(feed_key), "%s-%s", safe_name, mac_str + 8);
+        } else {
+            snprintf(feed_key, sizeof(feed_key), "%s", mac_str);
+        }
+        
+        // Luo temp feed
+        if ((devices[i].field_mask & FIELD_TEMP) && (aio_feed_types & FIELD_TEMP)) {
+            char url[256];
+            char payload[256];
+            snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds", aio_username);
+            snprintf(payload, sizeof(payload), "{\"key\":\"%s-temp\",\"name\":\"%s Temperature\"}", 
+                     feed_key, devices[i].name[0] ? devices[i].name : "Device");
+            
+            esp_http_client_config_t config = {
+                .url = url,
+                .method = HTTP_METHOD_POST,
+                .crt_bundle_attach = esp_crt_bundle_attach,
+            };
+            esp_http_client_handle_t client = esp_http_client_init(&config);
+            esp_http_client_set_header(client, "Content-Type", "application/json");
+            esp_http_client_set_header(client, "X-AIO-Key", aio_key);
+            esp_http_client_set_post_field(client, payload, strlen(payload));
+            
+            esp_err_t err = esp_http_client_perform(client);
+            int status = esp_http_client_get_status_code(client);
+            esp_http_client_cleanup(client);
+            
+            if (err == ESP_OK && (status == 200 || status == 201)) {
+                created++;
+                if (created > 1) strcat(response, ",");
+                char item[128];
+                snprintf(item, sizeof(item), "\"%s-temp\"", feed_key);
+                strcat(response, item);
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        
+        // Luo hum feed
+        if ((devices[i].field_mask & FIELD_HUM) && (aio_feed_types & FIELD_HUM)) {
+            char url[256];
+            char payload[256];
+            snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds", aio_username);
+            snprintf(payload, sizeof(payload), "{\"key\":\"%s-hum\",\"name\":\"%s Humidity\"}", 
+                     feed_key, devices[i].name[0] ? devices[i].name : "Device");
+            
+            esp_http_client_config_t config = {
+                .url = url,
+                .method = HTTP_METHOD_POST,
+                .crt_bundle_attach = esp_crt_bundle_attach,
+            };
+            esp_http_client_handle_t client = esp_http_client_init(&config);
+            esp_http_client_set_header(client, "Content-Type", "application/json");
+            esp_http_client_set_header(client, "X-AIO-Key", aio_key);
+            esp_http_client_set_post_field(client, payload, strlen(payload));
+            
+            esp_err_t err = esp_http_client_perform(client);
+            int status = esp_http_client_get_status_code(client);
+            esp_http_client_cleanup(client);
+            
+            if (err == ESP_OK && (status == 200 || status == 201)) {
+                created++;
+                if (created > 1) strcat(response, ",");
+                char item[128];
+                snprintf(item, sizeof(item), "\"%s-hum\"", feed_key);
+                strcat(response, item);
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+    }
+    
+    char end[64];
+    snprintf(end, sizeof(end), "],\"count\":%d}", created);
+    strcat(response, end);
+    
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    free(response);
+    return ESP_OK;
+}
+
+// API: Poista feedit tyypin mukaan (temp/hum/bat)
+static esp_err_t api_aio_delete_feeds_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    
+    if (strlen(aio_username) == 0 || strlen(aio_key) == 0) {
+        const char* resp = "{\"ok\":false,\"error\":\"Adafruit IO ei määritetty\"}";
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    // Hae types parametri query stringistä
+    char query[64];
+    uint8_t types_to_delete = 0;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char types_param[8];
+        if (httpd_query_key_value(query, "types", types_param, sizeof(types_param)) == ESP_OK) {
+            types_to_delete = (uint8_t)atoi(types_param);
+        }
+    }
+    
+    if (types_to_delete == 0) {
+        const char* resp = "{\"ok\":false,\"error\":\"Ei poistettavia tyyppejä\"}";
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    int deleted = 0;
+    const char* suffixes[3] = {"-temp", "-hum", "-bat"};
+    uint8_t type_bits[3] = {FIELD_TEMP, FIELD_HUM, FIELD_BAT};
+    
+    // Käy läpi jokainen tyyppi joka pitää poistaa
+    for (int t = 0; t < 3; t++) {
+        if (!(types_to_delete & type_bits[t])) continue;
+        
+        // Käy läpi kaikki näkyvät laitteet
+        for (int i = 0; i < device_count; i++) {
+            if (!devices[i].visible) continue;
+            
+            // Generoi feed key
+            char feed_key[64];
+            char mac_str[20];
+            snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
+                     devices[i].addr[0], devices[i].addr[1], devices[i].addr[2], 
+                     devices[i].addr[3], devices[i].addr[4], devices[i].addr[5]);
+            
+            if (strlen(devices[i].name) > 0) {
+                char safe_name[MAX_NAME_LEN];
+                int j = 0;
+                char prev = '\0';
+                for (int k = 0; k < strlen(devices[i].name) && j < sizeof(safe_name) - 1; k++) {
+                    char c = devices[i].name[k];
+                    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+                        safe_name[j++] = c;
+                        prev = c;
+                    } else if (c >= 'A' && c <= 'Z') {
+                        safe_name[j++] = c + 32;
+                        prev = c + 32;
+                    } else if (c == ' ' || c == '_' || c == '-') {
+                        if (prev != '-' && j > 0) {
+                            safe_name[j++] = '-';
+                            prev = '-';
+                        }
+                    }
+                }
+                safe_name[j] = '\0';
+                snprintf(feed_key, sizeof(feed_key), "%s-%s%s", safe_name, mac_str + 8, suffixes[t]);
+            } else {
+                snprintf(feed_key, sizeof(feed_key), "%s%s", mac_str, suffixes[t]);
+            }
+            
+            // Poista feed
+            char url[256];
+            snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds/%s", aio_username, feed_key);
+            
+            esp_http_client_config_t config = {
+                .url = url,
+                .method = HTTP_METHOD_DELETE,
+                .crt_bundle_attach = esp_crt_bundle_attach,
+            };
+            esp_http_client_handle_t client = esp_http_client_init(&config);
+            esp_http_client_set_header(client, "X-AIO-Key", aio_key);
+            
+            esp_err_t err = esp_http_client_perform(client);
+            int status = esp_http_client_get_status_code(client);
+            esp_http_client_cleanup(client);
+            
+            if (err == ESP_OK && (status == 200 || status == 204)) {
+                deleted++;
+                ESP_LOGI(AIO_TAG, "Feed poistettu: %s", feed_key);
+            }
+            vTaskDelay(pdMS_TO_TICKS(150));
+        }
+    }
+    
+    char response[128];
+    snprintf(response, sizeof(response), "{\"ok\":true,\"deleted\":%d}", deleted);
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
 }
 
 // API: Lähetä data nyt (testaus)
@@ -843,6 +1076,7 @@ static esp_err_t api_aio_config_handler(httpd_req_t *req) {
     char *user_start = strstr(buf, "\"username\":\"");
     char *key_start = strstr(buf, "\"key\":\"");
     char *enabled_start = strstr(buf, "\"enabled\":");
+    char *types_start = strstr(buf, "\"feedTypes\":");
     
     if (!user_start || !key_start) {
         const char* resp = "{\"ok\":false,\"error\":\"Invalid JSON\"}";
@@ -857,6 +1091,7 @@ static esp_err_t api_aio_config_handler(httpd_req_t *req) {
     char username[64] = {0};
     char key[128] = {0};
     bool enabled = true;
+    uint8_t feed_types = FIELD_TEMP | FIELD_HUM;  // Oletus
     
     char *user_end = strchr(user_start, '"');
     char *key_end = strchr(key_start, '"');
@@ -877,7 +1112,14 @@ static esp_err_t api_aio_config_handler(httpd_req_t *req) {
             enabled = (strncmp(enabled_start, "true", 4) == 0);
         }
         
-        save_aio_config(username, key, enabled);
+        if (types_start) {
+            types_start += 12;  // Skip "feedTypes":
+            int types_val = 0;
+            sscanf(types_start, "%d", &types_val);
+            feed_types = (uint8_t)types_val;
+        }
+        
+        save_aio_config(username, key, enabled, feed_types);
         
         const char* resp = "{\"ok\":true}";
         httpd_resp_set_type(req, "application/json");
@@ -898,10 +1140,11 @@ static esp_err_t api_aio_get_handler(httpd_req_t *req) {
     
     char response[256];
     snprintf(response, sizeof(response), 
-             "{\"ok\":true,\"username\":\"%s\",\"enabled\":%s,\"has_key\":%s}",
+             "{\"ok\":true,\"username\":\"%s\",\"enabled\":%s,\"has_key\":%s,\"feedTypes\":%d}",
              aio_username,
              aio_enabled ? "true" : "false",
-             strlen(aio_key) > 0 ? "true" : "false");
+             strlen(aio_key) > 0 ? "true" : "false",
+             aio_feed_types);
     
     httpd_resp_sendstr(req, response);
     return ESP_OK;
@@ -1270,7 +1513,7 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 13;
     config.stack_size = 8192;
     
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -1345,6 +1588,22 @@ static void start_webserver(void) {
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_aio_send);
+        
+        httpd_uri_t api_aio_create = {
+            .uri = "/api/aio/create_feeds",
+            .method = HTTP_POST,
+            .handler = api_aio_create_feeds_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_aio_create);
+        
+        httpd_uri_t api_aio_delete = {
+            .uri = "/api/aio/delete_feeds",
+            .method = HTTP_DELETE,
+            .handler = api_aio_delete_feeds_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_aio_delete);
         
         ESP_LOGI(TAG, "HTTP-palvelin käynnistetty");
     }
