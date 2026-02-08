@@ -6,6 +6,8 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
 #include "nimble/nimble_port.h"
@@ -20,14 +22,17 @@
 
 static const char *TAG = "BLE_SCAN";
 static const char *WIFI_TAG = "WiFi";
+static const char *AIO_TAG = "AdafruitIO";
 
 #define MAX_DEVICES 50
 #define MAX_NAME_LEN 32
 #define NVS_NAMESPACE "devices"
 #define NVS_WIFI_NAMESPACE "wifi"
+#define NVS_AIO_NAMESPACE "aio"
 
 #define BOOT_BUTTON_GPIO 0
 #define BOOT_HOLD_TIME_MS 5000
+#define AIO_SEND_INTERVAL_MS (5 * 60 * 1000)  // 5 minuuttia
 typedef struct {
     uint8_t addr[6];
     int8_t rssi;
@@ -57,6 +62,10 @@ static httpd_handle_t server = NULL;
 static bool setup_mode = false;
 static char wifi_ssid[64] = {0};
 static char wifi_password[64] = {0};
+static char aio_username[64] = {0};
+static char aio_key[128] = {0};
+static bool aio_enabled = false;
+static esp_timer_handle_t aio_timer = NULL;
 
 // Skannauksen hallinta
 // HUOM: Skannaus pyörii JATKUVASTI, mutta uusia laitteita lisätään vain discovery-moden aikana
@@ -453,6 +462,53 @@ static void check_boot_button(void) {
     }
 }
 
+// Adafruit IO NVS -funktiot
+static bool load_aio_config(void) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_AIO_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        ESP_LOGW(AIO_TAG, "Adafruit IO -asetuksia ei löydy");
+        return false;
+    }
+    
+    size_t user_len = sizeof(aio_username);
+    size_t key_len = sizeof(aio_key);
+    uint8_t enabled = 0;
+    
+    esp_err_t err_user = nvs_get_str(nvs, "username", aio_username, &user_len);
+    esp_err_t err_key = nvs_get_str(nvs, "key", aio_key, &key_len);
+    nvs_get_u8(nvs, "enabled", &enabled);
+    
+    nvs_close(nvs);
+    
+    if (err_user == ESP_OK && err_key == ESP_OK && strlen(aio_username) > 0 && strlen(aio_key) > 0) {
+        aio_enabled = (enabled != 0);
+        ESP_LOGI(AIO_TAG, "Asetukset ladattu: %s, enabled=%d", aio_username, aio_enabled);
+        return true;
+    }
+    
+    return false;
+}
+
+static void save_aio_config(const char* username, const char* key, bool enabled) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_AIO_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGE(AIO_TAG, "NVS:n avaus epäonnistui");
+        return;
+    }
+    
+    nvs_set_str(nvs, "username", username);
+    nvs_set_str(nvs, "key", key);
+    nvs_set_u8(nvs, "enabled", enabled ? 1 : 0);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    
+    strncpy(aio_username, username, sizeof(aio_username) - 1);
+    strncpy(aio_key, key, sizeof(aio_key) - 1);
+    aio_enabled = enabled;
+    
+    ESP_LOGI(AIO_TAG, "Asetukset tallennettu");
+}
+
 static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -505,6 +561,198 @@ static void wifi_init(void) {
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
         ESP_ERROR_CHECK(esp_wifi_start());
     }
+}
+
+// ============================================
+// ADAFRUIT IO DATA UPLOAD
+// ============================================
+
+static void send_device_to_aio(const ble_device_t *dev) {
+    if (!aio_enabled || !dev->has_sensor_data) return;
+    
+    char url[256];
+    char payload[256];
+    
+    // Feed key: käytä nimeä jos on, muuten MAC
+    char feed_key[64];
+    char mac_str[20];
+    snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
+             dev->addr[0], dev->addr[1], dev->addr[2], dev->addr[3], dev->addr[4], dev->addr[5]);
+    
+    if (strlen(dev->name) > 0) {
+        // Muunna nimi feed keyksi: lowercase, välilyönnit → viivat
+        char safe_name[MAX_NAME_LEN];
+        int j = 0;
+        char prev = '\0';
+        for (int i = 0; i < strlen(dev->name) && j < sizeof(safe_name) - 1; i++) {
+            char c = dev->name[i];
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+                safe_name[j++] = c;
+                prev = c;
+            } else if (c >= 'A' && c <= 'Z') {
+                safe_name[j++] = c + 32;  // Lowercase
+                prev = c + 32;
+            } else if (c == ' ' || c == '_' || c == '-') {
+                // Lisää viiva vain jos edellinen ei ollut viiva
+                if (prev != '-' && j > 0) {
+                    safe_name[j++] = '-';
+                    prev = '-';
+                }
+            }
+        }
+        safe_name[j] = '\0';
+        snprintf(feed_key, sizeof(feed_key), "%s-%s", safe_name, mac_str + 8);  // nimi + 4 viimeistä MAC:ia
+    } else {
+        snprintf(feed_key, sizeof(feed_key), "%s", mac_str);
+    }
+    
+    // Lähetä lämpötila
+    if (dev->field_mask & FIELD_TEMP) {
+        char feed_name[80];
+        snprintf(feed_name, sizeof(feed_name), "%s-temp", feed_key);
+        snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds/%s/data", aio_username, feed_name);
+        
+        // Lisää metadata: laitteen nimi ja MAC
+        if (strlen(dev->name) > 0) {
+            snprintf(payload, sizeof(payload), "{\"value\":\"%.2f\",\"feed_key\":\"%s\",\"metadata\":\"%s (%02X:%02X:%02X:%02X:%02X:%02X)\"}",
+                     dev->temperature, feed_name, dev->name,
+                     dev->addr[0], dev->addr[1], dev->addr[2], dev->addr[3], dev->addr[4], dev->addr[5]);
+        } else {
+            snprintf(payload, sizeof(payload), "{\"value\":\"%.2f\",\"feed_key\":\"%s\",\"metadata\":\"MAC: %02X:%02X:%02X:%02X:%02X:%02X\"}",
+                     dev->temperature, feed_name,
+                     dev->addr[0], dev->addr[1], dev->addr[2], dev->addr[3], dev->addr[4], dev->addr[5]);
+        }
+        
+        esp_http_client_config_t config = {
+            .url = url,
+            .method = HTTP_METHOD_POST,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_header(client, "X-AIO-Key", aio_key);
+        esp_http_client_set_post_field(client, payload, strlen(payload));
+        
+        esp_err_t err = esp_http_client_perform(client);
+        int status = esp_http_client_get_status_code(client);
+        if (err == ESP_OK && status == 200) {
+            ESP_LOGI(AIO_TAG, "Temp lähetetty: %s = %.2f", feed_key, dev->temperature);
+        } else {
+            ESP_LOGE(AIO_TAG, "Temp epäonnistui: %s, HTTP %d", esp_err_to_name(err), status);
+        }
+        esp_http_client_cleanup(client);
+        vTaskDelay(pdMS_TO_TICKS(100)); // Pieni viive requestien välillä
+    }
+    
+    // Lähetä kosteus
+    if (dev->field_mask & FIELD_HUM) {
+        snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds/%s-hum/data", aio_username, feed_key);
+        
+        if (strlen(dev->name) > 0) {
+            snprintf(payload, sizeof(payload), "{\"value\":\"%d\",\"metadata\":\"%s (%02X:%02X:%02X:%02X:%02X:%02X)\"}",
+                     dev->humidity, dev->name,
+                     dev->addr[0], dev->addr[1], dev->addr[2], dev->addr[3], dev->addr[4], dev->addr[5]);
+        } else {
+            snprintf(payload, sizeof(payload), "{\"value\":\"%d\",\"metadata\":\"MAC: %02X:%02X:%02X:%02X:%02X:%02X\"}",
+                     dev->humidity,
+                     dev->addr[0], dev->addr[1], dev->addr[2], dev->addr[3], dev->addr[4], dev->addr[5]);
+        }
+        
+        esp_http_client_config_t config = {
+            .url = url,
+            .method = HTTP_METHOD_POST,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_header(client, "X-AIO-Key", aio_key);
+        esp_http_client_set_post_field(client, payload, strlen(payload));
+        
+        esp_err_t err = esp_http_client_perform(client);
+        int status = esp_http_client_get_status_code(client);
+        if (err == ESP_OK && status == 200) {
+            ESP_LOGI(AIO_TAG, "Hum lähetetty: %s = %d", feed_key, dev->humidity);
+        } else {
+            ESP_LOGE(AIO_TAG, "Hum epäonnistui: %s, HTTP %d", esp_err_to_name(err), status);
+        }
+        esp_http_client_cleanup(client);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    // Lähetä akun taso
+    if (dev->field_mask & FIELD_BAT) {
+        snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds/%s-bat/data", aio_username, feed_key);
+        
+        if (strlen(dev->name) > 0) {
+            snprintf(payload, sizeof(payload), "{\"value\":\"%d\",\"metadata\":\"%s (%02X:%02X:%02X:%02X:%02X:%02X)\"}",
+                     dev->battery_pct, dev->name,
+                     dev->addr[0], dev->addr[1], dev->addr[2], dev->addr[3], dev->addr[4], dev->addr[5]);
+        } else {
+            snprintf(payload, sizeof(payload), "{\"value\":\"%d\",\"metadata\":\"MAC: %02X:%02X:%02X:%02X:%02X:%02X\"}",
+                     dev->battery_pct,
+                     dev->addr[0], dev->addr[1], dev->addr[2], dev->addr[3], dev->addr[4], dev->addr[5]);
+        }
+        
+        esp_http_client_config_t config = {
+            .url = url,
+            .method = HTTP_METHOD_POST,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        esp_http_client_set_header(client, "X-AIO-Key", aio_key);
+        esp_http_client_set_post_field(client, payload, strlen(payload));
+        
+        esp_err_t err = esp_http_client_perform(client);
+        if (err == ESP_OK) {
+            ESP_LOGI(AIO_TAG, "Bat lähetetty: %s = %d", feed_key, dev->battery_pct);
+        }
+        esp_http_client_cleanup(client);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+static void aio_upload_task(void *arg) {
+    ESP_LOGI(AIO_TAG, "Aloitetaan datan lähetys Adafruit IO:lle...");
+    
+    int sent_count = 0;
+    for (int i = 0; i < device_count; i++) {
+        if (devices[i].visible && devices[i].has_sensor_data) {
+            send_device_to_aio(&devices[i]);
+            sent_count++;
+        }
+    }
+    
+    ESP_LOGI(AIO_TAG, "Lähetettiin %d laitetta", sent_count);
+    vTaskDelete(NULL);
+}
+
+static void aio_timer_callback(void* arg) {
+    if (!aio_enabled) return;
+    
+    // Luo taski joka lähettää datan (ei blokoi timeria)
+    xTaskCreate(aio_upload_task, "aio_upload", 8192, NULL, 5, NULL);
+}
+
+// API: Lähetä data nyt (testaus)
+static esp_err_t api_aio_send_now_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    
+    if (!aio_enabled || strlen(aio_username) == 0 || strlen(aio_key) == 0) {
+        const char* resp = "{\"ok\":false,\"error\":\"Adafruit IO ei käytössä\"}";
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    // Luo taski joka lähettää datan
+    xTaskCreate(aio_upload_task, "aio_upload", 8192, NULL, 5, NULL);
+    
+    const char* resp = "{\"ok\":true,\"message\":\"Lähetys aloitettu\"}";
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
 }
 
 // ============================================
@@ -578,6 +826,84 @@ static esp_err_t api_setup_handler(httpd_req_t *req) {
     const char* resp = "{\"ok\":false,\"error\":\"Parse error\"}";
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// API: Adafruit IO asetukset
+static esp_err_t api_aio_config_handler(httpd_req_t *req) {
+    char buf[512];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    // Parseroidaan JSON
+    char *user_start = strstr(buf, "\"username\":\"");
+    char *key_start = strstr(buf, "\"key\":\"");
+    char *enabled_start = strstr(buf, "\"enabled\":");
+    
+    if (!user_start || !key_start) {
+        const char* resp = "{\"ok\":false,\"error\":\"Invalid JSON\"}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    user_start += 12;  // Skip "username":"
+    key_start += 7;     // Skip "key":"
+    
+    char username[64] = {0};
+    char key[128] = {0};
+    bool enabled = true;
+    
+    char *user_end = strchr(user_start, '"');
+    char *key_end = strchr(key_start, '"');
+    
+    if (user_end && key_end) {
+        int user_len = user_end - user_start;
+        int key_len = key_end - key_start;
+        
+        if (user_len > 0 && user_len < 64) {
+            strncpy(username, user_start, user_len);
+        }
+        if (key_len > 0 && key_len < 128) {
+            strncpy(key, key_start, key_len);
+        }
+        
+        if (enabled_start) {
+            enabled_start += 10;  // Skip "enabled":
+            enabled = (strncmp(enabled_start, "true", 4) == 0);
+        }
+        
+        save_aio_config(username, key, enabled);
+        
+        const char* resp = "{\"ok\":true}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        
+        return ESP_OK;
+    }
+    
+    const char* resp = "{\"ok\":false,\"error\":\"Parse error\"}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// API: Hae Adafruit IO asetukset
+static esp_err_t api_aio_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    
+    char response[256];
+    snprintf(response, sizeof(response), 
+             "{\"ok\":true,\"username\":\"%s\",\"enabled\":%s,\"has_key\":%s}",
+             aio_username,
+             aio_enabled ? "true" : "false",
+             strlen(aio_key) > 0 ? "true" : "false");
+    
+    httpd_resp_sendstr(req, response);
     return ESP_OK;
 }
 
@@ -944,7 +1270,7 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 12;
     config.stack_size = 8192;
     
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -996,6 +1322,30 @@ static void start_webserver(void) {
         };
         httpd_register_uri_handler(server, &api_setup);
         
+        httpd_uri_t api_aio_config = {
+            .uri = "/api/aio/config",
+            .method = HTTP_POST,
+            .handler = api_aio_config_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_aio_config);
+        
+        httpd_uri_t api_aio_get = {
+            .uri = "/api/aio/config",
+            .method = HTTP_GET,
+            .handler = api_aio_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_aio_get);
+        
+        httpd_uri_t api_aio_send = {
+            .uri = "/api/aio/send_now",
+            .method = HTTP_POST,
+            .handler = api_aio_send_now_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_aio_send);
+        
         ESP_LOGI(TAG, "HTTP-palvelin käynnistetty");
     }
 }
@@ -1025,6 +1375,20 @@ void app_main() {
     
     wifi_init();
     start_webserver();
+    
+    // Lataa Adafruit IO asetukset
+    load_aio_config();
+    
+    // Käynnistä Adafruit IO ajastin jos asetukset on määritelty
+    if (aio_enabled && strlen(aio_username) > 0 && strlen(aio_key) > 0) {
+        esp_timer_create_args_t aio_timer_args = {
+            .callback = aio_timer_callback,
+            .name = "aio_timer"
+        };
+        esp_timer_create(&aio_timer_args, &aio_timer);
+        esp_timer_start_periodic(aio_timer, AIO_SEND_INTERVAL_MS * 1000);  // Microsekunteja
+        ESP_LOGI(AIO_TAG, "Ajastin käynnistetty, lähetys %d min välein", AIO_SEND_INTERVAL_MS / 60000);
+    }
     
     // BLE vain normaalitilassa, ei setup-modessa
     if (!setup_mode) {
