@@ -49,6 +49,28 @@ bool ble_parse_pvvx_format(const uint8_t *svc_data, uint8_t svc_len,
                            ble_sensor_data_t *sensor_data);
 
 /**
+ * Parse MiBeacon (Xiaomi Original Firmware) data
+ * 
+ * @param svc_data Service data payload (from UUID 0xFE95)
+ * @param svc_len Service data length
+ * @param sensor_data Output structure for parsed sensor data
+ * @return true if successfully parsed
+ */
+bool ble_parse_mibeacon_format(const uint8_t *svc_data, uint8_t svc_len, 
+                               ble_sensor_data_t *sensor_data);
+
+/**
+ * Parse BTHome v2 format data
+ * 
+ * @param svc_data Service data payload (from UUID 0xFCD2)
+ * @param svc_len Service data length
+ * @param sensor_data Output structure for parsed sensor data
+ * @return true if successfully parsed
+ */
+bool ble_parse_bthome_v2_format(const uint8_t *svc_data, uint8_t svc_len, 
+                                ble_sensor_data_t *sensor_data);
+
+/**
  * Get device type string based on company ID
  * 
  * @param company_id BLE company ID

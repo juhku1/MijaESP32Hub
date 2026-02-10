@@ -46,6 +46,7 @@ typedef struct {
     uint8_t humidity;
     uint8_t battery_pct;
     uint16_t battery_mv;
+    char firmware_type[16];  // "pvvx", "ATC", "MiBeacon", "BTHome", tai "Unknown"
 } ble_device_t;
 
 // Field mask bitit
@@ -310,11 +311,12 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                     ESP_LOGI(TAG, "BLE-advertsissä ei nimeä tälle laitteelle");
                 }
                 
-                // Sensoridata (pvvx/ATC-muoto)
+                // Sensoridata (pvvx/ATC-muoto UUID 0x181A tai MiBeacon UUID 0xFE95 tai BTHome v2 UUID 0xFCD2)
                 if (fields.svc_data_uuid16 != NULL && fields.svc_data_uuid16_len >= 13) {
                     uint16_t uuid = fields.svc_data_uuid16[0] | (fields.svc_data_uuid16[1] << 8);
                     
                     if (uuid == 0x181A) {
+                        // pvvx tai ATC custom firmware
                         ble_sensor_data_t sensor_data;
                         bool parsed = false;
                         
@@ -329,6 +331,36 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                             devices[idx].humidity = sensor_data.humidity;
                             devices[idx].battery_pct = sensor_data.battery_pct;
                             devices[idx].battery_mv = sensor_data.battery_mv;
+                            strncpy(devices[idx].firmware_type, sensor_data.device_type, sizeof(devices[idx].firmware_type) - 1);
+                            devices[idx].firmware_type[sizeof(devices[idx].firmware_type) - 1] = '\0';
+                            devices[idx].has_sensor_data = true;
+                        }
+                    } else if (uuid == 0xFE95) {
+                        // MiBeacon - Xiaomi alkuperäinen firmware
+                        ble_sensor_data_t sensor_data;
+                        bool parsed = ble_parse_mibeacon_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
+                        
+                        if (parsed) {
+                            devices[idx].temperature = sensor_data.temperature;
+                            devices[idx].humidity = sensor_data.humidity;
+                            devices[idx].battery_pct = sensor_data.battery_pct;
+                            devices[idx].battery_mv = sensor_data.battery_mv;
+                            strncpy(devices[idx].firmware_type, sensor_data.device_type, sizeof(devices[idx].firmware_type) - 1);
+                            devices[idx].firmware_type[sizeof(devices[idx].firmware_type) - 1] = '\0';
+                            devices[idx].has_sensor_data = true;
+                        }
+                    } else if (uuid == 0xFCD2) {
+                        // BTHome v2 - Yleinen standardi (pvvx tukee tätä)
+                        ble_sensor_data_t sensor_data;
+                        bool parsed = ble_parse_bthome_v2_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
+                        
+                        if (parsed) {
+                            devices[idx].temperature = sensor_data.temperature;
+                            devices[idx].humidity = sensor_data.humidity;
+                            devices[idx].battery_pct = sensor_data.battery_pct;
+                            devices[idx].battery_mv = sensor_data.battery_mv;
+                            strncpy(devices[idx].firmware_type, sensor_data.device_type, sizeof(devices[idx].firmware_type) - 1);
+                            devices[idx].firmware_type[sizeof(devices[idx].firmware_type) - 1] = '\0';
                             devices[idx].has_sensor_data = true;
                         }
                     }
@@ -1138,10 +1170,11 @@ static esp_err_t api_aio_config_handler(httpd_req_t *req) {
 static esp_err_t api_aio_get_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     
-    char response[256];
+    char response[512];
     snprintf(response, sizeof(response), 
-             "{\"ok\":true,\"username\":\"%s\",\"enabled\":%s,\"has_key\":%s,\"feedTypes\":%d}",
+             "{\"ok\":true,\"username\":\"%s\",\"key\":\"%s\",\"enabled\":%s,\"has_key\":%s,\"feedTypes\":%d}",
              aio_username,
+             aio_key,
              aio_enabled ? "true" : "false",
              strlen(aio_key) > 0 ? "true" : "false",
              aio_feed_types);
@@ -1235,6 +1268,7 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
             snprintf(item, sizeof(item),
                 "%s{\"addr\":\"%s\",\"name\":\"%s\",\"rssi\":%d,"
                 "\"hasSensor\":true,\"temp\":%.1f,\"hum\":%d,\"bat\":%d,\"batMv\":%d,"
+                "\"firmware\":\"%s\","
                 "\"saved\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
                 first ? "" : ",",
                 addr_str,
@@ -1244,6 +1278,7 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
                 devices[i].humidity,
                 devices[i].battery_pct,
                 devices[i].battery_mv,
+                devices[i].firmware_type[0] ? devices[i].firmware_type : "Unknown",
                 devices[i].visible ? "true" : "false",
                 devices[i].show_mac ? "true" : "false",
                 devices[i].field_mask,
@@ -1573,6 +1608,7 @@ static void start_webserver(void) {
         };
         httpd_register_uri_handler(server, &api_aio_config);
         
+    
         httpd_uri_t api_aio_get = {
             .uri = "/api/aio/config",
             .method = HTTP_GET,
