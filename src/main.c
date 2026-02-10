@@ -384,10 +384,10 @@ static void ble_app_on_sync(void) {
     ESP_LOGI(TAG, "BLE-stack synkronoitu ja valmis");
     ESP_LOGI(TAG, "Käynnistetään JATKUVA skannaus olemassa olevien laitteiden seurantaan");
     
-    // Käynnistä jatkuva skannaus
+    // Käynnistä jatkuva skannaus (WiFi-yhteensopivilla parametreilla)
     struct ble_gap_disc_params disc_params = {0};
-    disc_params.itvl = 0x10;
-    disc_params.window = 0x10;
+    disc_params.itvl = 0x50;    // 80 * 0.625ms = 50ms interval
+    disc_params.window = 0x30;  // 48 * 0.625ms = 30ms window (60% duty cycle)
     disc_params.passive = 0;  // Active scan jotta saadaan scan response (nimi)
     
     int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params, ble_gap_event, NULL);
@@ -584,19 +584,37 @@ static void wifi_init(void) {
         ESP_LOGI(WIFI_TAG, "✓ AP käynnistetty: BLE-Monitor-Setup");
         ESP_LOGI(WIFI_TAG, "Avaa selaimessa: http://192.168.4.1");
     } else {
-        // WiFi määritetty -> STA-tila
+        // WiFi määritetty -> STA+AP -tila (molemmat päällä)
         ESP_LOGI(WIFI_TAG, "Yhdistetään verkkoon: %s", wifi_ssid);
         setup_mode = false;
         
         esp_netif_create_default_wifi_sta();
+        esp_netif_create_default_wifi_ap();
         
-        wifi_config_t wifi_config = {0};
-        strncpy((char*)wifi_config.sta.ssid, wifi_ssid, sizeof(wifi_config.sta.ssid));
-        strncpy((char*)wifi_config.sta.password, wifi_password, sizeof(wifi_config.sta.password));
+        // STA-konfiguraatio
+        wifi_config_t sta_config = {0};
+        strncpy((char*)sta_config.sta.ssid, wifi_ssid, sizeof(sta_config.sta.ssid));
+        strncpy((char*)sta_config.sta.password, wifi_password, sizeof(sta_config.sta.password));
         
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+        // AP-konfiguraatio (vara-access point)
+        wifi_config_t ap_config = {
+            .ap = {
+                .ssid = "BLE-Monitor",
+                .ssid_len = strlen("BLE-Monitor"),
+                .channel = 1,
+                .password = "",
+                .max_connection = 2,
+                .authmode = WIFI_AUTH_OPEN,
+            },
+        };
+        
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
         ESP_ERROR_CHECK(esp_wifi_start());
+        
+        ESP_LOGI(WIFI_TAG, "✓ AP käynnistetty: BLE-Monitor (vara-access point)");
+        ESP_LOGI(WIFI_TAG, "Vara-AP: http://192.168.4.1");
     }
 }
 
