@@ -47,6 +47,7 @@ typedef struct {
     uint8_t battery_pct;
     uint16_t battery_mv;
     char firmware_type[16];  // "pvvx", "ATC", "MiBeacon", "BTHome", tai "Unknown"
+    char source[32];  // "local" tai "satellite-192.168.68.129"
 } ble_device_t;
 
 // Field mask bitit
@@ -263,6 +264,7 @@ static int find_or_add_device(uint8_t *addr, bool allow_adding_new) {
         devices[device_count].rssi = 0;
         devices[device_count].last_seen = 0;
         devices[device_count].has_sensor_data = false;
+        strcpy(devices[device_count].source, "local");  // Paikallinen laite
         
         // Lataa tallennetut asetukset (nimi, show_mac, field_mask)
         load_device_settings(addr, devices[device_count].name, 
@@ -1286,7 +1288,7 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
             snprintf(item, sizeof(item),
                 "%s{\"addr\":\"%s\",\"name\":\"%s\",\"rssi\":%d,"
                 "\"hasSensor\":true,\"temp\":%.1f,\"hum\":%d,\"bat\":%d,\"batMv\":%d,"
-                "\"firmware\":\"%s\","
+                "\"firmware\":\"%s\",\"source\":\"%s\","
                 "\"saved\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
                 first ? "" : ",",
                 addr_str,
@@ -1297,6 +1299,7 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
                 devices[i].battery_pct,
                 devices[i].battery_mv,
                 devices[i].firmware_type[0] ? devices[i].firmware_type : "Unknown",
+                devices[i].source[0] ? devices[i].source : "local",
                 devices[i].visible ? "true" : "false",
                 devices[i].show_mac ? "true" : "false",
                 devices[i].field_mask,
@@ -1304,11 +1307,12 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
         } else {
             snprintf(item, sizeof(item),
                 "%s{\"addr\":\"%s\",\"name\":\"%s\",\"rssi\":%d,"
-                "\"hasSensor\":false,\"saved\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
+                "\"hasSensor\":false,\"source\":\"%s\",\"saved\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
                 first ? "" : ",",
                 addr_str,
                 devices[i].name[0] ? devices[i].name : "Unknown",
                 devices[i].rssi,
+                devices[i].source[0] ? devices[i].source : "local",
                 devices[i].visible ? "true" : "false",
                 devices[i].show_mac ? "true" : "false",
                 devices[i].field_mask,
@@ -1321,6 +1325,181 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
     
     httpd_resp_sendstr(req, json);
     free(json);
+    return ESP_OK;
+}
+
+// API: Vastaanota satelliitti-dataa
+static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
+    char buf[512];
+    int ret = httpd_req_recv(req, buf, sizeof(buf)-1);
+    if (ret <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    // Hae lähettäjän IP-osoite
+    char client_ip[16] = {0};
+    struct sockaddr_in6 client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    if (httpd_req_get_hdr_value_str(req, "X-Forwarded-For", client_ip, sizeof(client_ip)) != ESP_OK) {
+        // Jos X-Forwarded-For ei löydy, käytä suoraa yhteyttä
+        if (getpeername(httpd_req_to_sockfd(req), (struct sockaddr *)&client_addr, &addr_len) == 0) {
+            if (client_addr.sin6_family == AF_INET) {
+                struct sockaddr_in *addr_in = (struct sockaddr_in *)&client_addr;
+                inet_ntoa_r(addr_in->sin_addr, client_ip, sizeof(client_ip));
+            }
+        }
+    }
+    
+    ESP_LOGI(TAG, "🛰️  Satellite data from %s (%d bytes)", client_ip, ret);
+    
+    // Parse JSON: {"mac":"AA:BB:CC:DD:EE:FF","rssi":-65,"data":"0201061AFF..."}
+    char mac_str[18] = {0};
+    int rssi = 0;
+    char hex_data[256] = {0};
+    
+    char *p = strstr(buf, "\"mac\":\"");
+    if (p) {
+        p += 7;
+        char *end = strchr(p, '"');
+        if (end && (end - p) < 18) {
+            memcpy(mac_str, p, end - p);
+        }
+    }
+    
+    p = strstr(buf, "\"rssi\":");
+    if (p) {
+        sscanf(p + 7, "%d", &rssi);
+    }
+    
+    p = strstr(buf, "\"data\":\"");
+    if (p) {
+        p += 8;
+        char *end = strchr(p, '"');
+        if (end && (end - p) < 256) {
+            memcpy(hex_data, p, end - p);
+        }
+    }
+    
+    // Parse MAC address
+    uint8_t mac_addr[6];
+    if (sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+               &mac_addr[0], &mac_addr[1], &mac_addr[2], &mac_addr[3], &mac_addr[4], &mac_addr[5]) == 6) {
+        
+        // Find or add device
+        int idx = -1;
+        for (int i = 0; i < device_count; i++) {
+            if (memcmp(devices[i].addr, mac_addr, 6) == 0) {
+                idx = i;
+                break;
+            }
+        }
+        
+        if (idx < 0 && device_count < MAX_DEVICES) {
+            // New device from satellite
+            idx = device_count++;
+            memcpy(devices[idx].addr, mac_addr, 6);
+            devices[idx].visible = true;
+            devices[idx].show_mac = false;
+            devices[idx].field_mask = FIELD_ALL;
+            snprintf(devices[idx].name, MAX_NAME_LEN, "Sat-%02X%02X", mac_addr[4], mac_addr[5]);
+            devices[idx].has_sensor_data = false;
+            snprintf(devices[idx].source, sizeof(devices[idx].source), "satellite-%s", client_ip);
+            
+            ESP_LOGI(TAG, "🛰️  New satellite device: %s from %s", mac_str, client_ip);
+        }
+        
+        if (idx >= 0) {
+            // Päivitä source jos oli tyhjä tai "local" (muuttui satelliitiksi)
+            if (strlen(devices[idx].source) == 0 || strcmp(devices[idx].source, "local") == 0) {
+                snprintf(devices[idx].source, sizeof(devices[idx].source), "satellite-%s", client_ip);
+            }
+            
+            devices[idx].rssi = rssi;
+            devices[idx].last_seen = xTaskGetTickCount() / portTICK_PERIOD_MS;
+            
+            // Convert hex string to bytes and parse BLE advertisement data
+            uint8_t raw_data[128];
+            int data_len = strlen(hex_data) / 2;
+            for (int i = 0; i < data_len && i < 128; i++) {
+                char byte_str[3] = {hex_data[i*2], hex_data[i*2+1], 0};
+                raw_data[i] = (uint8_t)strtol(byte_str, NULL, 16);
+            }
+            
+            // Parse advertisement fields
+            struct ble_hs_adv_fields fields;
+            if (ble_hs_adv_parse_fields(&fields, raw_data, data_len) == 0) {
+                // Copy device name if user hasn't set custom name
+                if (fields.name != NULL && fields.name_len > 0) {
+                    if (devices[idx].name[0] == '\0' || strncmp(devices[idx].name, "Sat-", 4) == 0) {
+                        int copy_len = (fields.name_len < MAX_NAME_LEN - 1) ? fields.name_len : MAX_NAME_LEN - 1;
+                        memcpy(devices[idx].name, fields.name, copy_len);
+                        devices[idx].name[copy_len] = '\0';
+                    }
+                }
+                
+                // Parse sensor data (pvvx/ATC format UUID 0x181A, MiBeacon UUID 0xFE95, or BTHome v2 UUID 0xFCD2)
+                if (fields.svc_data_uuid16 != NULL && fields.svc_data_uuid16_len >= 13) {
+                    uint16_t uuid = fields.svc_data_uuid16[0] | (fields.svc_data_uuid16[1] << 8);
+                    
+                    if (uuid == 0x181A) {
+                        // pvvx or ATC custom firmware
+                        ble_sensor_data_t sensor_data;
+                        bool parsed = false;
+                        
+                        if (fields.svc_data_uuid16_len >= 17) {
+                            parsed = ble_parse_pvvx_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
+                        } else if (fields.svc_data_uuid16_len >= 15) {
+                            parsed = ble_parse_atc_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
+                        }
+                        
+                        if (parsed) {
+                            devices[idx].temperature = sensor_data.temperature;
+                            devices[idx].humidity = sensor_data.humidity;
+                            devices[idx].battery_pct = sensor_data.battery_pct;
+                            devices[idx].battery_mv = sensor_data.battery_mv;
+                            strncpy(devices[idx].firmware_type, sensor_data.device_type, sizeof(devices[idx].firmware_type) - 1);
+                            devices[idx].firmware_type[sizeof(devices[idx].firmware_type) - 1] = '\0';
+                            devices[idx].has_sensor_data = true;
+                        }
+                    } else if (uuid == 0xFE95) {
+                        // MiBeacon - Xiaomi original firmware
+                        ble_sensor_data_t sensor_data;
+                        bool parsed = ble_parse_mibeacon_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
+                        
+                        if (parsed) {
+                            devices[idx].temperature = sensor_data.temperature;
+                            devices[idx].humidity = sensor_data.humidity;
+                            devices[idx].battery_pct = sensor_data.battery_pct;
+                            devices[idx].battery_mv = sensor_data.battery_mv;
+                            strncpy(devices[idx].firmware_type, sensor_data.device_type, sizeof(devices[idx].firmware_type) - 1);
+                            devices[idx].firmware_type[sizeof(devices[idx].firmware_type) - 1] = '\0';
+                            devices[idx].has_sensor_data = true;
+                        }
+                    } else if (uuid == 0xFCD2) {
+                        // BTHome v2
+                        ble_sensor_data_t sensor_data;
+                        bool parsed = ble_parse_bthome_v2_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
+                        
+                        if (parsed) {
+                            devices[idx].temperature = sensor_data.temperature;
+                            devices[idx].humidity = sensor_data.humidity;
+                            devices[idx].battery_pct = sensor_data.battery_pct;
+                            devices[idx].battery_mv = sensor_data.battery_mv;
+                            strncpy(devices[idx].firmware_type, sensor_data.device_type, sizeof(devices[idx].firmware_type) - 1);
+                            devices[idx].firmware_type[sizeof(devices[idx].firmware_type) - 1] = '\0';
+                            devices[idx].has_sensor_data = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Send response
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
     return ESP_OK;
 }
 
@@ -1566,7 +1745,7 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 13;
+    config.max_uri_handlers = 14;
     config.stack_size = 8192;
     
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -1585,6 +1764,14 @@ static void start_webserver(void) {
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_devices);
+        
+        httpd_uri_t api_satellite_data = {
+            .uri = "/api/satellite-data",
+            .method = HTTP_POST,
+            .handler = api_satellite_data_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_satellite_data);
         
         httpd_uri_t api_toggle_visibility = {
             .uri = "/api/toggle-visibility",
