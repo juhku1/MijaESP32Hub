@@ -39,6 +39,7 @@ typedef struct {
     uint32_t last_seen;
     bool visible;  // Näkyykö laite
     char name[MAX_NAME_LEN];
+    char adv_name[MAX_NAME_LEN];  // Mainosnimi (BLE-advertisement)
     bool show_mac;  // Näytetäänkö MAC-osoite
     uint16_t field_mask;  // Bitmask: mitä kenttiä näytetään (temp, hum, bat, batMv, rssi)
     bool has_sensor_data;
@@ -219,6 +220,7 @@ static void load_all_devices_from_nvs(void) {
                 devices[device_count].rssi = 0;
                 devices[device_count].last_seen = 0;
                 devices[device_count].has_sensor_data = false;
+                devices[device_count].adv_name[0] = '\0';
                 
                 // Lataa muut asetukset
                 load_device_settings(addr, devices[device_count].name,
@@ -264,6 +266,7 @@ static int find_or_add_device(uint8_t *addr, bool allow_adding_new) {
         devices[device_count].rssi = 0;
         devices[device_count].last_seen = 0;
         devices[device_count].has_sensor_data = false;
+        devices[device_count].adv_name[0] = '\0';
         strcpy(devices[device_count].source, "local");  // Paikallinen laite
         
         // Lataa tallennetut asetukset (nimi, show_mac, field_mask)
@@ -288,6 +291,12 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
         // Monitoring mode: päivitä vain visible=true laitteita
         int idx = find_or_add_device(event->disc.addr.val, allow_new_devices);
         
+        // LOG: Paikallinen BLE-havainto
+        ESP_LOGI(TAG, "📡 LOCAL BLE: %02X:%02X:%02X:%02X:%02X:%02X, RSSI: %d dBm, data_len: %d",
+                 event->disc.addr.val[5], event->disc.addr.val[4], event->disc.addr.val[3],
+                 event->disc.addr.val[2], event->disc.addr.val[1], event->disc.addr.val[0],
+                 event->disc.rssi, event->disc.length_data);
+        
         // Jos laite ei ole listassa tai ei ole näkyvissä (ja ei olla discovery-modessa), ohita
         if (idx < 0 || (!allow_new_devices && !devices[idx].visible)) {
             return 0;  // Ei päivitetä piilotettuja laitteita monitoring-modessa
@@ -303,8 +312,10 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                 
                 // Laitteen nimi (kopioidaan vain jos käyttäjä ei ole asettanut omaa nimeä)
                 if (fields.name != NULL && fields.name_len > 0) {
+                    int copy_len = (fields.name_len < MAX_NAME_LEN - 1) ? fields.name_len : MAX_NAME_LEN - 1;
+                    memcpy(devices[idx].adv_name, fields.name, copy_len);
+                    devices[idx].adv_name[copy_len] = '\0';
                     if (devices[idx].name[0] == '\0') {
-                        int copy_len = (fields.name_len < MAX_NAME_LEN - 1) ? fields.name_len : MAX_NAME_LEN - 1;
                         memcpy(devices[idx].name, fields.name, copy_len);
                         devices[idx].name[copy_len] = '\0';
                         ESP_LOGI(TAG, "BLE-nimi kopioitu: %s", devices[idx].name);
@@ -1286,13 +1297,14 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
             available |= FIELD_RSSI; // RSSI aina saatavilla
             
             snprintf(item, sizeof(item),
-                "%s{\"addr\":\"%s\",\"name\":\"%s\",\"rssi\":%d,"
+                "%s{\"addr\":\"%s\",\"name\":\"%s\",\"advName\":\"%s\",\"rssi\":%d,"
                 "\"hasSensor\":true,\"temp\":%.1f,\"hum\":%d,\"bat\":%d,\"batMv\":%d,"
                 "\"firmware\":\"%s\",\"source\":\"%s\","
                 "\"saved\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
                 first ? "" : ",",
                 addr_str,
                 devices[i].name[0] ? devices[i].name : "Unknown",
+                devices[i].adv_name[0] ? devices[i].adv_name : "",
                 devices[i].rssi,
                 devices[i].temperature,
                 devices[i].humidity,
@@ -1306,11 +1318,12 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
                 available);
         } else {
             snprintf(item, sizeof(item),
-                "%s{\"addr\":\"%s\",\"name\":\"%s\",\"rssi\":%d,"
+                "%s{\"addr\":\"%s\",\"name\":\"%s\",\"advName\":\"%s\",\"rssi\":%d,"
                 "\"hasSensor\":false,\"source\":\"%s\",\"saved\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
                 first ? "" : ",",
                 addr_str,
                 devices[i].name[0] ? devices[i].name : "Unknown",
+                devices[i].adv_name[0] ? devices[i].adv_name : "",
                 devices[i].rssi,
                 devices[i].source[0] ? devices[i].source : "local",
                 devices[i].visible ? "true" : "false",
@@ -1342,13 +1355,39 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
     char client_ip[16] = {0};
     struct sockaddr_in6 client_addr;
     socklen_t addr_len = sizeof(client_addr);
-    if (httpd_req_get_hdr_value_str(req, "X-Forwarded-For", client_ip, sizeof(client_ip)) != ESP_OK) {
+    
+    ESP_LOGI(TAG, "🛰️  Getting client IP...");
+    if (httpd_req_get_hdr_value_str(req, "X-Forwarded-For", client_ip, sizeof(client_ip)) == ESP_OK) {
+        ESP_LOGI(TAG, "  X-Forwarded-For: %s", client_ip);
+    } else {
+        ESP_LOGI(TAG, "  No X-Forwarded-For header");
         // Jos X-Forwarded-For ei löydy, käytä suoraa yhteyttä
-        if (getpeername(httpd_req_to_sockfd(req), (struct sockaddr *)&client_addr, &addr_len) == 0) {
+        int sockfd = httpd_req_to_sockfd(req);
+        ESP_LOGI(TAG, "  Socket FD: %d", sockfd);
+        
+        if (getpeername(sockfd, (struct sockaddr *)&client_addr, &addr_len) == 0) {
+            ESP_LOGI(TAG, "  getpeername OK, family: %d (AF_INET=%d, AF_INET6=%d)", 
+                     client_addr.sin6_family, AF_INET, AF_INET6);
+            
             if (client_addr.sin6_family == AF_INET) {
                 struct sockaddr_in *addr_in = (struct sockaddr_in *)&client_addr;
                 inet_ntoa_r(addr_in->sin_addr, client_ip, sizeof(client_ip));
+                ESP_LOGI(TAG, "  IPv4 address: %s", client_ip);
+            } else if (client_addr.sin6_family == AF_INET6) {
+                // IPv6-osoite
+                char ipv6_str[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, &client_addr.sin6_addr, ipv6_str, sizeof(ipv6_str));
+                ESP_LOGI(TAG, "  IPv6 address: %s", ipv6_str);
+                // Kokeile muuttaa IPv4:ksi jos on IPv4-mapped
+                if (IN6_IS_ADDR_V4MAPPED(&client_addr.sin6_addr)) {
+                    struct in_addr ipv4_addr;
+                    memcpy(&ipv4_addr, &client_addr.sin6_addr.s6_addr[12], 4);
+                    inet_ntoa_r(ipv4_addr, client_ip, sizeof(client_ip));
+                    ESP_LOGI(TAG, "  IPv4-mapped: %s", client_ip);
+                }
             }
+        } else {
+            ESP_LOGE(TAG, "  getpeername FAILED");
         }
     }
     
@@ -1382,10 +1421,14 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
         }
     }
     
-    // Parse MAC address
+    // Parse MAC address (satelliitti käyttää normaalia järjestystä)
     uint8_t mac_addr[6];
     if (sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
                &mac_addr[0], &mac_addr[1], &mac_addr[2], &mac_addr[3], &mac_addr[4], &mac_addr[5]) == 6) {
+        
+        // LOG: Satelliittihavainto
+        ESP_LOGI(TAG, "🛰️  SATELLITE: %s, RSSI: %d dBm, hex_len: %d, from: %s",
+                 mac_str, rssi, strlen(hex_data), client_ip);
         
         // Find or add device
         int idx = -1;
@@ -1397,13 +1440,19 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
         }
         
         if (idx < 0 && device_count < MAX_DEVICES) {
-            // New device from satellite
+            // New device from satellite (oletuksena PIILOTETTU, näkyy vasta kun valitaan scan-valikossa)
             idx = device_count++;
             memcpy(devices[idx].addr, mac_addr, 6);
-            devices[idx].visible = true;
-            devices[idx].show_mac = false;
+            devices[idx].visible = load_visibility(mac_addr);
+            devices[idx].show_mac = true;
             devices[idx].field_mask = FIELD_ALL;
-            snprintf(devices[idx].name, MAX_NAME_LEN, "Sat-%02X%02X", mac_addr[4], mac_addr[5]);
+            devices[idx].adv_name[0] = '\0';
+            load_device_settings(mac_addr, devices[idx].name,
+                               &devices[idx].show_mac,
+                               &devices[idx].field_mask);
+            if (devices[idx].name[0] == '\0') {
+                snprintf(devices[idx].name, MAX_NAME_LEN, "Sat-%02X%02X", mac_addr[4], mac_addr[5]);
+            }
             devices[idx].has_sensor_data = false;
             snprintf(devices[idx].source, sizeof(devices[idx].source), "satellite-%s", client_ip);
             
@@ -1429,11 +1478,17 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
             
             // Parse advertisement fields
             struct ble_hs_adv_fields fields;
-            if (ble_hs_adv_parse_fields(&fields, raw_data, data_len) == 0) {
+            int parse_result = ble_hs_adv_parse_fields(&fields, raw_data, data_len);
+            ESP_LOGI(TAG, "  🔍 Parse fields result: %d, data_len: %d", parse_result, data_len);
+            
+            if (parse_result == 0) {
                 // Copy device name if user hasn't set custom name
                 if (fields.name != NULL && fields.name_len > 0) {
+                    ESP_LOGI(TAG, "  📛 Device name found: len=%d", fields.name_len);
+                    int copy_len = (fields.name_len < MAX_NAME_LEN - 1) ? fields.name_len : MAX_NAME_LEN - 1;
+                    memcpy(devices[idx].adv_name, fields.name, copy_len);
+                    devices[idx].adv_name[copy_len] = '\0';
                     if (devices[idx].name[0] == '\0' || strncmp(devices[idx].name, "Sat-", 4) == 0) {
-                        int copy_len = (fields.name_len < MAX_NAME_LEN - 1) ? fields.name_len : MAX_NAME_LEN - 1;
                         memcpy(devices[idx].name, fields.name, copy_len);
                         devices[idx].name[copy_len] = '\0';
                     }
@@ -1442,6 +1497,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                 // Parse sensor data (pvvx/ATC format UUID 0x181A, MiBeacon UUID 0xFE95, or BTHome v2 UUID 0xFCD2)
                 if (fields.svc_data_uuid16 != NULL && fields.svc_data_uuid16_len >= 13) {
                     uint16_t uuid = fields.svc_data_uuid16[0] | (fields.svc_data_uuid16[1] << 8);
+                    ESP_LOGI(TAG, "  🔬 Service UUID: 0x%04X, len: %d", uuid, fields.svc_data_uuid16_len);
                     
                     if (uuid == 0x181A) {
                         // pvvx or ATC custom firmware
@@ -1450,11 +1506,15 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                         
                         if (fields.svc_data_uuid16_len >= 17) {
                             parsed = ble_parse_pvvx_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
+                            ESP_LOGI(TAG, "  ✅ pvvx parse: %s", parsed ? "SUCCESS" : "FAILED");
                         } else if (fields.svc_data_uuid16_len >= 15) {
                             parsed = ble_parse_atc_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
+                            ESP_LOGI(TAG, "  ✅ ATC parse: %s", parsed ? "SUCCESS" : "FAILED");
                         }
                         
                         if (parsed) {
+                            ESP_LOGI(TAG, "  🌡️  Satellite sensor: %.1f°C, %d%%, %d%%", 
+                                     sensor_data.temperature/100.0, sensor_data.humidity/100, sensor_data.battery_pct);
                             devices[idx].temperature = sensor_data.temperature;
                             devices[idx].humidity = sensor_data.humidity;
                             devices[idx].battery_pct = sensor_data.battery_pct;
@@ -1467,6 +1527,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                         // MiBeacon - Xiaomi original firmware
                         ble_sensor_data_t sensor_data;
                         bool parsed = ble_parse_mibeacon_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
+                        ESP_LOGI(TAG, "  ✅ MiBeacon parse: %s", parsed ? "SUCCESS" : "FAILED");
                         
                         if (parsed) {
                             devices[idx].temperature = sensor_data.temperature;
@@ -1481,6 +1542,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                         // BTHome v2
                         ble_sensor_data_t sensor_data;
                         bool parsed = ble_parse_bthome_v2_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
+                        ESP_LOGI(TAG, "  ✅ BTHome parse: %s", parsed ? "SUCCESS" : "FAILED");
                         
                         if (parsed) {
                             devices[idx].temperature = sensor_data.temperature;
@@ -1572,6 +1634,54 @@ static esp_err_t api_toggle_visibility_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Vastaus lähetetty");
     
     httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+// API: Poista kaikkien laitteiden näkyvyysvalinnat (myös NVS:stä)
+static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
+    int cleared_nvs = 0;
+
+    // Päivitä kaikki laitteet piilotetuiksi muistissa
+    for (int i = 0; i < device_count; i++) {
+        devices[i].visible = false;
+    }
+
+    // Poista kaikki visibility-avaimet NVS:stä (12 hex-merkkiä)
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_iterator_t it = NULL;
+        esp_err_t res = nvs_entry_find("nvs", NVS_NAMESPACE, NVS_TYPE_ANY, &it);
+        while (res == ESP_OK) {
+            nvs_entry_info_t info;
+            nvs_entry_info(it, &info);
+
+            if (strlen(info.key) == 12) {
+                bool is_hex = true;
+                for (int i = 0; i < 12; i++) {
+                    if (!((info.key[i] >= '0' && info.key[i] <= '9') ||
+                          (info.key[i] >= 'A' && info.key[i] <= 'F'))) {
+                        is_hex = false;
+                        break;
+                    }
+                }
+                if (is_hex) {
+                    if (nvs_erase_key(nvs, info.key) == ESP_OK) {
+                        cleared_nvs++;
+                    }
+                }
+            }
+
+            res = nvs_entry_next(&it);
+        }
+        nvs_release_iterator(it);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+
+    char response[128];
+    snprintf(response, sizeof(response), "{\"ok\":true,\"cleared\":%d}", cleared_nvs);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, response);
     return ESP_OK;
 }
 
@@ -1745,7 +1855,7 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 14;
+    config.max_uri_handlers = 15;
     config.stack_size = 8192;
     
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -1780,6 +1890,14 @@ static void start_webserver(void) {
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_toggle_visibility);
+
+        httpd_uri_t api_clear_visibility = {
+            .uri = "/api/clear-visibility",
+            .method = HTTP_POST,
+            .handler = api_clear_visibility_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_clear_visibility);
         
         httpd_uri_t api_update_settings = {
             .uri = "/api/update-settings",
