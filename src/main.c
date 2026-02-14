@@ -10,6 +10,8 @@
 #include "esp_crt_bundle.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -33,6 +35,8 @@ static const char *AIO_TAG = "AdafruitIO";
 #define BOOT_BUTTON_GPIO 0
 #define BOOT_HOLD_TIME_MS 5000
 #define AIO_SEND_INTERVAL_MS (5 * 60 * 1000)  // 5 minuuttia
+#define DISCOVERY_PORT 19798
+#define DISCOVERY_INTERVAL_MS 5000
 typedef struct {
     uint8_t addr[6];
     int8_t rssi;
@@ -65,6 +69,8 @@ static httpd_handle_t server = NULL;
 static bool setup_mode = false;
 static char wifi_ssid[64] = {0};
 static char wifi_password[64] = {0};
+static bool wifi_connected = false;
+static char master_ip[16] = {0};
 static char aio_username[64] = {0};
 static char aio_key[128] = {0};
 static bool aio_enabled = false;
@@ -422,11 +428,44 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(WIFI_TAG, "WiFi katkesi, yhdistetään uudelleen...");
+        wifi_connected = false;
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        wifi_connected = true;
+        snprintf(master_ip, sizeof(master_ip), IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(WIFI_TAG, "✓ Yhdistetty! IP-osoite: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(WIFI_TAG, "Avaa selaimessa: http://" IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+static void discovery_broadcast_task(void *param) {
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(WIFI_TAG, "Discovery socket create failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int broadcast = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port = htons(DISCOVERY_PORT),
+        .sin_addr.s_addr = htonl(INADDR_BROADCAST),
+    };
+
+    while (1) {
+        if (wifi_connected && master_ip[0] != '\0') {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "SATMASTER %s 80", master_ip);
+            int err = sendto(sock, msg, strlen(msg), 0, (struct sockaddr *)&dest, sizeof(dest));
+            if (err < 0) {
+                ESP_LOGW(WIFI_TAG, "Discovery broadcast failed");
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(DISCOVERY_INTERVAL_MS));
     }
 }
 
@@ -1993,6 +2032,9 @@ void app_main() {
     
     wifi_init();
     start_webserver();
+
+    // Käynnistä satelliittien discovery-broadcast
+    xTaskCreate(discovery_broadcast_task, "discovery_broadcast", 4096, NULL, 4, NULL);
     
     // Lataa Adafruit IO asetukset
     load_aio_config();
