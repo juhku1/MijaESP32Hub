@@ -12,6 +12,7 @@
 #include "driver/gpio.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include "mdns.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -39,6 +40,7 @@ static const char *AIO_TAG = "AdafruitIO";
 #define BLE_RATE_INTERVAL_MS 10000
 #define DISCOVERY_PORT 19798
 #define DISCOVERY_INTERVAL_MS 5000
+#define MDNS_HOSTNAME "ble-master"
 typedef struct {
     uint8_t addr[6];
     int8_t rssi;
@@ -79,6 +81,7 @@ static char wifi_ssid[64] = {0};
 static char wifi_password[64] = {0};
 static bool wifi_connected = false;
 static char master_ip[16] = {0};
+static bool mdns_started = false;
 static char aio_username[64] = {0};
 static char aio_key[128] = {0};
 static bool aio_enabled = false;
@@ -541,6 +544,22 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         snprintf(master_ip, sizeof(master_ip), IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(WIFI_TAG, "✓ Yhdistetty! IP-osoite: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(WIFI_TAG, "Avaa selaimessa: http://" IPSTR, IP2STR(&event->ip_info.ip));
+        if (!mdns_started) {
+            esp_err_t err = mdns_init();
+            if (err == ESP_OK) {
+                mdns_hostname_set(MDNS_HOSTNAME);
+                mdns_instance_name_set("BLE Master");
+                mdns_txt_item_t txt_data[] = {
+                    {"role", "master"},
+                    {"path", "/api/satellite-data"},
+                };
+                mdns_service_add("BLE Master", "_http", "_tcp", 80, txt_data, 2);
+                mdns_started = true;
+                ESP_LOGI(WIFI_TAG, "mDNS käynnistetty: http://%s.local", MDNS_HOSTNAME);
+            } else {
+                ESP_LOGW(WIFI_TAG, "mDNS init epäonnistui: %s", esp_err_to_name(err));
+            }
+        }
     }
 }
 
