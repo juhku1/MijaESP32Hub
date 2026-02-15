@@ -21,6 +21,7 @@
 #include "ble_parser.h"
 #include "webserver.h"
 #include "setup_page.h"
+#include <stdint.h>
 
 static const char *TAG = "BLE_SCAN";
 static const char *WIFI_TAG = "WiFi";
@@ -35,16 +36,23 @@ static const char *AIO_TAG = "AdafruitIO";
 #define BOOT_BUTTON_GPIO 0
 #define BOOT_HOLD_TIME_MS 5000
 #define AIO_SEND_INTERVAL_MS (5 * 60 * 1000)  // 5 minuuttia
+#define BLE_RATE_INTERVAL_MS 10000
 #define DISCOVERY_PORT 19798
 #define DISCOVERY_INTERVAL_MS 5000
 typedef struct {
     uint8_t addr[6];
     int8_t rssi;
     uint32_t last_seen;
+    uint32_t last_sensor_seen; // Milloin viimeinen BLE-sensoridata saatiin
+    uint32_t last_adv_seen; // Milloin viimeinen BLE-adv havaittiin
+    uint32_t adv_interval_ms_last; // Viimeisin adv-väli (ms)
+    uint32_t adv_interval_ms_avg; // Keskimääräinen adv-väli (ms)
+    uint32_t adv_interval_samples; // Kuinka monta väliä laskettu
     bool visible;  // Näkyykö laite
     char name[MAX_NAME_LEN];
     char adv_name[MAX_NAME_LEN];  // Mainosnimi (BLE-advertisement)
     bool show_mac;  // Näytetäänkö MAC-osoite
+    bool show_ip;  // Näytetäänkö satelliitti-IP
     uint16_t field_mask;  // Bitmask: mitä kenttiä näytetään (temp, hum, bat, batMv, rssi)
     bool has_sensor_data;
     float temperature;
@@ -76,15 +84,21 @@ static char aio_key[128] = {0};
 static bool aio_enabled = false;
 static uint8_t aio_feed_types = FIELD_TEMP | FIELD_HUM;  // Oletuksena temp + hum
 static esp_timer_handle_t aio_timer = NULL;
+static esp_timer_handle_t ble_rate_timer = NULL;
+
+// BLE-pakettimäärät
+static uint32_t ble_adv_count = 0;
+static uint32_t ble_sensor_count = 0;
+static uint32_t sat_adv_count = 0;
+static uint32_t sat_sensor_count = 0;
 
 // Skannauksen hallinta
 // HUOM: Skannaus pyörii JATKUVASTI, mutta uusia laitteita lisätään vain discovery-moden aikana
 static bool allow_new_devices = false;  // Sallitaanko uusien laitteiden lisääminen (discovery mode)
-static esp_timer_handle_t discovery_timer = NULL;  // Ajastin discovery-moden lopettamiseen
-#define DISCOVERY_DURATION_MS 30000  // Discovery-moden kesto millisekunteina (30s)
+static bool master_ble_enabled = true;  // Onko paikallinen BLE-skannaus käytössä (vai vain satelliitit)
 
 // Tallenna laitteen asetukset NVS:ään
-static void save_device_settings(uint8_t *addr, const char *name, bool show_mac, uint16_t field_mask) {
+static void save_device_settings(uint8_t *addr, const char *name, bool show_mac, bool show_ip, uint16_t field_mask) {
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         char base_key[20];
@@ -102,6 +116,11 @@ static void save_device_settings(uint8_t *addr, const char *name, bool show_mac,
         char mac_key[24];
         snprintf(mac_key, sizeof(mac_key), "%s_m", base_key);
         nvs_set_u8(nvs, mac_key, show_mac ? 1 : 0);
+
+        // Tallenna show_ip
+        char ip_key[24];
+        snprintf(ip_key, sizeof(ip_key), "%s_i", base_key);
+        nvs_set_u8(nvs, ip_key, show_ip ? 1 : 0);
         
         // Tallenna field_mask
         char field_key[24];
@@ -110,17 +129,18 @@ static void save_device_settings(uint8_t *addr, const char *name, bool show_mac,
         
         nvs_commit(nvs);
         nvs_close(nvs);
-        ESP_LOGI(TAG, "Tallennettu asetukset: %s, name=%s, show_mac=%d, fields=0x%04X", 
-                 base_key, name, show_mac, field_mask);
+        ESP_LOGI(TAG, "Tallennettu asetukset: %s, name=%s, show_mac=%d, show_ip=%d, fields=0x%04X", 
+             base_key, name, show_mac, show_ip, field_mask);
     }
 }
 
 // Lataa laitteen asetukset NVS:stä
-static void load_device_settings(uint8_t *addr, char *name_out, bool *show_mac_out, uint16_t *field_mask_out) {
+    static void load_device_settings(uint8_t *addr, char *name_out, bool *show_mac_out, bool *show_ip_out, uint16_t *field_mask_out) {
     nvs_handle_t nvs;
     // Oletusarvot
     name_out[0] = '\0';
     *show_mac_out = true;
+    *show_ip_out = false;
     *field_mask_out = FIELD_ALL;
     
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
@@ -140,6 +160,14 @@ static void load_device_settings(uint8_t *addr, char *name_out, bool *show_mac_o
         uint8_t show_mac_val = 1;
         if (nvs_get_u8(nvs, mac_key, &show_mac_val) == ESP_OK) {
             *show_mac_out = show_mac_val ? true : false;
+        }
+
+        // Lataa show_ip
+        char ip_key[24];
+        snprintf(ip_key, sizeof(ip_key), "%s_i", base_key);
+        uint8_t show_ip_val = 0;
+        if (nvs_get_u8(nvs, ip_key, &show_ip_val) == ESP_OK) {
+            *show_ip_out = show_ip_val ? true : false;
         }
         
         // Lataa field_mask
@@ -225,12 +253,18 @@ static void load_all_devices_from_nvs(void) {
                 devices[device_count].visible = load_visibility(addr);
                 devices[device_count].rssi = 0;
                 devices[device_count].last_seen = 0;
+                devices[device_count].last_sensor_seen = 0;
+                devices[device_count].last_adv_seen = 0;
+                devices[device_count].adv_interval_ms_last = 0;
+                devices[device_count].adv_interval_ms_avg = 0;
+                devices[device_count].adv_interval_samples = 0;
                 devices[device_count].has_sensor_data = false;
                 devices[device_count].adv_name[0] = '\0';
                 
                 // Lataa muut asetukset
                 load_device_settings(addr, devices[device_count].name,
                                    &devices[device_count].show_mac,
+                                   &devices[device_count].show_ip,
                                    &devices[device_count].field_mask);
                 
                 ESP_LOGI(TAG, "  Ladattu laite %d: %02X:%02X:%02X:%02X:%02X:%02X, name=%s",
@@ -271,14 +305,20 @@ static int find_or_add_device(uint8_t *addr, bool allow_adding_new) {
         devices[device_count].visible = false;  // Piilotettu kunnes käyttäjä lisää päänäkymään
         devices[device_count].rssi = 0;
         devices[device_count].last_seen = 0;
+        devices[device_count].last_sensor_seen = 0;
+        devices[device_count].last_adv_seen = 0;
+        devices[device_count].adv_interval_ms_last = 0;
+        devices[device_count].adv_interval_ms_avg = 0;
+        devices[device_count].adv_interval_samples = 0;
         devices[device_count].has_sensor_data = false;
         devices[device_count].adv_name[0] = '\0';
         strcpy(devices[device_count].source, "local");  // Paikallinen laite
         
         // Lataa tallennetut asetukset (nimi, show_mac, field_mask)
         load_device_settings(addr, devices[device_count].name, 
-                           &devices[device_count].show_mac,
-                           &devices[device_count].field_mask);
+                   &devices[device_count].show_mac,
+                   &devices[device_count].show_ip,
+                   &devices[device_count].field_mask);
         
         // Lataa visibility NVS:stä (jos tallennettu)
         devices[device_count].visible = load_visibility(addr);
@@ -293,6 +333,12 @@ static int find_or_add_device(uint8_t *addr, bool allow_adding_new) {
 
 static int ble_gap_event(struct ble_gap_event *event, void *arg) {
     if (event->type == BLE_GAP_EVENT_DISC) {
+        // Tarkista onko master BLE käytössä
+        if (!master_ble_enabled) {
+            return 0;  // Ohitetaan paikalliset BLE-havainnot
+        }
+        
+        ble_adv_count++;
         // Discovery mode: lisää uusia + päivitä kaikkia
         // Monitoring mode: päivitä vain visible=true laitteita
         int idx = find_or_add_device(event->disc.addr.val, allow_new_devices);
@@ -310,7 +356,22 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
         
         if (idx >= 0) {
             devices[idx].rssi = event->disc.rssi;
-            devices[idx].last_seen = xTaskGetTickCount();
+            uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            devices[idx].last_seen = now_ms;
+            if (devices[idx].last_adv_seen > 0 && now_ms >= devices[idx].last_adv_seen) {
+                uint32_t delta = now_ms - devices[idx].last_adv_seen;
+                devices[idx].adv_interval_ms_last = delta;
+                if (devices[idx].adv_interval_samples == 0) {
+                    devices[idx].adv_interval_ms_avg = delta;
+                } else {
+                    uint64_t sum = (uint64_t)devices[idx].adv_interval_ms_avg * devices[idx].adv_interval_samples + delta;
+                    devices[idx].adv_interval_ms_avg = (uint32_t)(sum / (devices[idx].adv_interval_samples + 1));
+                }
+                if (devices[idx].adv_interval_samples < UINT32_MAX) {
+                    devices[idx].adv_interval_samples++;
+                }
+            }
+            devices[idx].last_adv_seen = now_ms;
             
             // Parsitaan mainosdata
             struct ble_hs_adv_fields fields;
@@ -346,6 +407,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                         }
                         
                         if (parsed) {
+                            ble_sensor_count++;
                             devices[idx].temperature = sensor_data.temperature;
                             devices[idx].humidity = sensor_data.humidity;
                             devices[idx].battery_pct = sensor_data.battery_pct;
@@ -353,6 +415,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                             strncpy(devices[idx].firmware_type, sensor_data.device_type, sizeof(devices[idx].firmware_type) - 1);
                             devices[idx].firmware_type[sizeof(devices[idx].firmware_type) - 1] = '\0';
                             devices[idx].has_sensor_data = true;
+                            devices[idx].last_sensor_seen = now_ms;
                         }
                     } else if (uuid == 0xFE95) {
                         // MiBeacon - Xiaomi alkuperäinen firmware
@@ -360,6 +423,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                         bool parsed = ble_parse_mibeacon_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
                         
                         if (parsed) {
+                            ble_sensor_count++;
                             devices[idx].temperature = sensor_data.temperature;
                             devices[idx].humidity = sensor_data.humidity;
                             devices[idx].battery_pct = sensor_data.battery_pct;
@@ -367,6 +431,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                             strncpy(devices[idx].firmware_type, sensor_data.device_type, sizeof(devices[idx].firmware_type) - 1);
                             devices[idx].firmware_type[sizeof(devices[idx].firmware_type) - 1] = '\0';
                             devices[idx].has_sensor_data = true;
+                            devices[idx].last_sensor_seen = now_ms;
                         }
                     } else if (uuid == 0xFCD2) {
                         // BTHome v2 - Yleinen standardi (pvvx tukee tätä)
@@ -374,6 +439,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                         bool parsed = ble_parse_bthome_v2_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
                         
                         if (parsed) {
+                            ble_sensor_count++;
                             devices[idx].temperature = sensor_data.temperature;
                             devices[idx].humidity = sensor_data.humidity;
                             devices[idx].battery_pct = sensor_data.battery_pct;
@@ -381,6 +447,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                             strncpy(devices[idx].firmware_type, sensor_data.device_type, sizeof(devices[idx].firmware_type) - 1);
                             devices[idx].firmware_type[sizeof(devices[idx].firmware_type) - 1] = '\0';
                             devices[idx].has_sensor_data = true;
+                            devices[idx].last_sensor_seen = now_ms;
                         }
                     }
                 }
@@ -390,12 +457,31 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
     return 0;
 }
 
-// Timer callback: Lopettaa discovery moden (uusien laitteiden etsinnän)
-// Skannaus jatkuu edelleen olemassa olevien laitteiden arvojen päivittämiseksi
-static void stop_discovery_timer_callback(void* arg) {
-    ESP_LOGI(TAG, "Discovery-ajastin laukesi, lopetetaan uusien laitteiden etsintä");
-    ESP_LOGI(TAG, "Skannaus JATKUU olemassa olevien laitteiden arvojen päivittämiseksi");
-    allow_new_devices = false;
+static void ble_rate_timer_callback(void* arg) {
+    static uint32_t last_ble_adv = 0;
+    static uint32_t last_ble_sensor = 0;
+    static uint32_t last_sat_adv = 0;
+    static uint32_t last_sat_sensor = 0;
+
+    uint32_t adv = ble_adv_count;
+    uint32_t sensor = ble_sensor_count;
+    uint32_t sat_adv = sat_adv_count;
+    uint32_t sat_sensor = sat_sensor_count;
+
+    uint32_t d_adv = adv - last_ble_adv;
+    uint32_t d_sensor = sensor - last_ble_sensor;
+    uint32_t d_sat_adv = sat_adv - last_sat_adv;
+    uint32_t d_sat_sensor = sat_sensor - last_sat_sensor;
+
+    last_ble_adv = adv;
+    last_ble_sensor = sensor;
+    last_sat_adv = sat_adv;
+    last_sat_sensor = sat_sensor;
+
+    float interval_s = BLE_RATE_INTERVAL_MS / 1000.0f;
+    ESP_LOGI(TAG, "BLE rate: adv=%.1f/s sensor=%.1f/s | sat adv=%.1f/s sensor=%.1f/s",
+             d_adv / interval_s, d_sensor / interval_s,
+             d_sat_adv / interval_s, d_sat_sensor / interval_s);
 }
 
 // BLE-stack valmis, käynnistetään jatkuva skannaus
@@ -1261,30 +1347,72 @@ static esp_err_t api_start_scan_handler(httpd_req_t *req) {
     
     if (allow_new_devices) {
         ESP_LOGW(TAG, "Discovery mode on jo käynnissä");
-        httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Discovery mode jo käynnissä\"}");
+        httpd_resp_sendstr(req, "{\"ok\":true,\"already_running\":true}");
         return ESP_OK;
     }
     
-    ESP_LOGI(TAG, "Käynnistetään DISCOVERY MODE %d sekunnin ajaksi (skannaus pyörii jo taustalla)", DISCOVERY_DURATION_MS / 1000);
+    ESP_LOGI(TAG, "🔍 DISCOVERY MODE käynnistetty (ei ajastinta, pysyy päällä kunnes suljetaan)");
     
     // Salli uusien laitteiden lisääminen
     allow_new_devices = true;
     
-    // Luo ajastin jos ei vielä ole
-    if (discovery_timer == NULL) {
-        esp_timer_create_args_t timer_args = {
-            .callback = stop_discovery_timer_callback,
-            .name = "discovery_timer"
-        };
-        esp_timer_create(&timer_args, &discovery_timer);
+    httpd_resp_sendstr(req, "{\"ok\":true,\"already_running\":false}");
+    return ESP_OK;
+}
+
+// API: Lopeta discovery-mode (uusien laitteiden etsintä)
+static esp_err_t api_stop_scan_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_type(req, "application/json");
+    
+    ESP_LOGI(TAG, "🔍 DISCOVERY MODE lopetettu");
+    allow_new_devices = false;
+    
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+// API: Hae tai tallenna skannausasetukset (GET tai POST)
+static esp_err_t api_scan_settings_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_type(req, "application/json");
+    
+    if (req->method == HTTP_GET) {
+        // Palauta nykyiset asetukset
+        char response[128];
+        snprintf(response, sizeof(response), "{\"ok\":true,\"masterBleEnabled\":%s}", 
+                 master_ble_enabled ? "true" : "false");
+        httpd_resp_sendstr(req, response);
+    } else if (req->method == HTTP_POST) {
+        // Tallenna uudet asetukset
+        char buf[256];
+        int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+        if (ret <= 0) {
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"Empty request\"}");
+            return ESP_OK;
+        }
+        buf[ret] = '\0';
+        
+        // Parsitaan JSON (yksinkertainen string-haku)
+        char *enabled_str = strstr(buf, "\"masterBleEnabled\":");
+        if (enabled_str) {
+            enabled_str += strlen("\"masterBleEnabled\":");
+            while (*enabled_str == ' ') enabled_str++;
+            master_ble_enabled = (strncmp(enabled_str, "true", 4) == 0);
+            ESP_LOGI(TAG, "⚙️ Master BLE skannaus: %s", master_ble_enabled ? "KÄYTÖSSÄ" : "POIS KÄYTÖSTÄ");
+            
+            // Tallenna NVS:ään
+            nvs_handle_t nvs;
+            if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+                nvs_set_u8(nvs, "scan_master", master_ble_enabled ? 1 : 0);
+                nvs_commit(nvs);
+                nvs_close(nvs);
+            }
+        }
+        
+        httpd_resp_sendstr(req, "{\"ok\":true}");
     }
     
-    // Käynnistä ajastin
-    esp_timer_start_once(discovery_timer, DISCOVERY_DURATION_MS * 1000);  // Microsekunteja
-    
-    char response[128];
-    snprintf(response, sizeof(response), "{\"ok\":true,\"duration\":%d}", DISCOVERY_DURATION_MS / 1000);
-    httpd_resp_sendstr(req, response);
     return ESP_OK;
 }
 
@@ -1314,11 +1442,39 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
     strcpy(json, "[");
     bool first = true;
     
+    uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    // Kerää näkyvät (tai kaikki) indeksit ja lajittele MAC-osoitteen mukaan
+    int indices[MAX_DEVICES];
+    int count = 0;
     for (int i = 0; i < device_count; i++) {
-        // Oletuksena vain visible=true, show_all=1 näyttää kaikki (discovery-popup)
         if (!show_all && !devices[i].visible) {
             continue;
         }
+        // Ohita master-laitteet jos master BLE on pois päältä
+        if (!master_ble_enabled) {
+            // Jos lähde on "local" tai tyhjä, se on master-laite
+            if (devices[i].source[0] == '\0' || strcmp(devices[i].source, "local") == 0) {
+                continue;
+            }
+        }
+        indices[count++] = i;
+    }
+
+    // Yksinkertainen bubble sort MAC-osoitteen (addr) mukaan
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = 0; j < count - i - 1; j++) {
+            ble_device_t *a = &devices[indices[j]];
+            ble_device_t *b = &devices[indices[j + 1]];
+            if (memcmp(a->addr, b->addr, 6) > 0) {
+                int tmp = indices[j];
+                indices[j] = indices[j + 1];
+                indices[j + 1] = tmp;
+            }
+        }
+    }
+    for (int k = 0; k < count; k++) {
+        int i = indices[k];
         
         char addr_str[18];
         snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -1326,6 +1482,12 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
             devices[i].addr[3], devices[i].addr[4], devices[i].addr[5]);
         
         char item[512];
+        uint32_t age_sec = 0;
+        uint32_t ref_ms = devices[i].has_sensor_data ? devices[i].last_sensor_seen : devices[i].last_seen;
+        if (ref_ms > 0 && now_ms >= ref_ms) {
+            age_sec = (now_ms - ref_ms) / 1000;
+        }
+
         if (devices[i].has_sensor_data) {
             // Määritä mitä kenttiä laite tukee
             uint16_t available = 0;
@@ -1339,7 +1501,8 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
                 "%s{\"addr\":\"%s\",\"name\":\"%s\",\"advName\":\"%s\",\"rssi\":%d,"
                 "\"hasSensor\":true,\"temp\":%.1f,\"hum\":%d,\"bat\":%d,\"batMv\":%d,"
                 "\"firmware\":\"%s\",\"source\":\"%s\","
-                "\"saved\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
+                "\"saved\":%s,\"showMac\":%s,\"showIp\":%s,\"fieldMask\":%d,\"availableFields\":%d,\"ageSec\":%lu,"
+                "\"advIntervalMsLast\":%lu,\"advIntervalMsAvg\":%lu}",
                 first ? "" : ",",
                 addr_str,
                 devices[i].name[0] ? devices[i].name : "Unknown",
@@ -1353,12 +1516,17 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
                 devices[i].source[0] ? devices[i].source : "local",
                 devices[i].visible ? "true" : "false",
                 devices[i].show_mac ? "true" : "false",
+                devices[i].show_ip ? "true" : "false",
                 devices[i].field_mask,
-                available);
+                available,
+                (unsigned long)age_sec,
+                (unsigned long)devices[i].adv_interval_ms_last,
+                (unsigned long)devices[i].adv_interval_ms_avg);
         } else {
             snprintf(item, sizeof(item),
                 "%s{\"addr\":\"%s\",\"name\":\"%s\",\"advName\":\"%s\",\"rssi\":%d,"
-                "\"hasSensor\":false,\"source\":\"%s\",\"saved\":%s,\"showMac\":%s,\"fieldMask\":%d,\"availableFields\":%d}",
+                "\"hasSensor\":false,\"source\":\"%s\",\"saved\":%s,\"showMac\":%s,\"showIp\":%s,\"fieldMask\":%d,\"availableFields\":%d,\"ageSec\":%lu,"
+                "\"advIntervalMsLast\":%lu,\"advIntervalMsAvg\":%lu}",
                 first ? "" : ",",
                 addr_str,
                 devices[i].name[0] ? devices[i].name : "Unknown",
@@ -1367,8 +1535,12 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
                 devices[i].source[0] ? devices[i].source : "local",
                 devices[i].visible ? "true" : "false",
                 devices[i].show_mac ? "true" : "false",
+                devices[i].show_ip ? "true" : "false",
                 devices[i].field_mask,
-                FIELD_RSSI); // Vain RSSI saatavilla
+                FIELD_RSSI,
+                (unsigned long)age_sec,
+                (unsigned long)devices[i].adv_interval_ms_last,
+                (unsigned long)devices[i].adv_interval_ms_avg); // Vain RSSI saatavilla
         }
         strcat(json, item);
         first = false;
@@ -1488,24 +1660,46 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
             devices[idx].adv_name[0] = '\0';
             load_device_settings(mac_addr, devices[idx].name,
                                &devices[idx].show_mac,
+                               &devices[idx].show_ip,
                                &devices[idx].field_mask);
             if (devices[idx].name[0] == '\0') {
                 snprintf(devices[idx].name, MAX_NAME_LEN, "Sat-%02X%02X", mac_addr[4], mac_addr[5]);
             }
             devices[idx].has_sensor_data = false;
+            devices[idx].last_sensor_seen = 0;
+            devices[idx].last_adv_seen = 0;
+            devices[idx].adv_interval_ms_last = 0;
+            devices[idx].adv_interval_ms_avg = 0;
+            devices[idx].adv_interval_samples = 0;
             snprintf(devices[idx].source, sizeof(devices[idx].source), "satellite-%s", client_ip);
             
             ESP_LOGI(TAG, "🛰️  New satellite device: %s from %s", mac_str, client_ip);
         }
         
         if (idx >= 0) {
+            sat_adv_count++;
             // Päivitä source jos oli tyhjä tai "local" (muuttui satelliitiksi)
             if (strlen(devices[idx].source) == 0 || strcmp(devices[idx].source, "local") == 0) {
                 snprintf(devices[idx].source, sizeof(devices[idx].source), "satellite-%s", client_ip);
             }
             
             devices[idx].rssi = rssi;
-            devices[idx].last_seen = xTaskGetTickCount() / portTICK_PERIOD_MS;
+            uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            devices[idx].last_seen = now_ms;
+            if (devices[idx].last_adv_seen > 0 && now_ms >= devices[idx].last_adv_seen) {
+                uint32_t delta = now_ms - devices[idx].last_adv_seen;
+                devices[idx].adv_interval_ms_last = delta;
+                if (devices[idx].adv_interval_samples == 0) {
+                    devices[idx].adv_interval_ms_avg = delta;
+                } else {
+                    uint64_t sum = (uint64_t)devices[idx].adv_interval_ms_avg * devices[idx].adv_interval_samples + delta;
+                    devices[idx].adv_interval_ms_avg = (uint32_t)(sum / (devices[idx].adv_interval_samples + 1));
+                }
+                if (devices[idx].adv_interval_samples < UINT32_MAX) {
+                    devices[idx].adv_interval_samples++;
+                }
+            }
+            devices[idx].last_adv_seen = now_ms;
             
             // Convert hex string to bytes and parse BLE advertisement data
             uint8_t raw_data[128];
@@ -1552,6 +1746,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                         }
                         
                         if (parsed) {
+                            sat_sensor_count++;
                             ESP_LOGI(TAG, "  🌡️  Satellite sensor: %.1f°C, %d%%, %d%%", 
                                      sensor_data.temperature/100.0, sensor_data.humidity/100, sensor_data.battery_pct);
                             devices[idx].temperature = sensor_data.temperature;
@@ -1561,6 +1756,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                             strncpy(devices[idx].firmware_type, sensor_data.device_type, sizeof(devices[idx].firmware_type) - 1);
                             devices[idx].firmware_type[sizeof(devices[idx].firmware_type) - 1] = '\0';
                             devices[idx].has_sensor_data = true;
+                            devices[idx].last_sensor_seen = now_ms;
                         }
                     } else if (uuid == 0xFE95) {
                         // MiBeacon - Xiaomi original firmware
@@ -1569,6 +1765,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                         ESP_LOGI(TAG, "  ✅ MiBeacon parse: %s", parsed ? "SUCCESS" : "FAILED");
                         
                         if (parsed) {
+                            sat_sensor_count++;
                             devices[idx].temperature = sensor_data.temperature;
                             devices[idx].humidity = sensor_data.humidity;
                             devices[idx].battery_pct = sensor_data.battery_pct;
@@ -1576,6 +1773,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                             strncpy(devices[idx].firmware_type, sensor_data.device_type, sizeof(devices[idx].firmware_type) - 1);
                             devices[idx].firmware_type[sizeof(devices[idx].firmware_type) - 1] = '\0';
                             devices[idx].has_sensor_data = true;
+                            devices[idx].last_sensor_seen = now_ms;
                         }
                     } else if (uuid == 0xFCD2) {
                         // BTHome v2
@@ -1584,6 +1782,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                         ESP_LOGI(TAG, "  ✅ BTHome parse: %s", parsed ? "SUCCESS" : "FAILED");
                         
                         if (parsed) {
+                            sat_sensor_count++;
                             devices[idx].temperature = sensor_data.temperature;
                             devices[idx].humidity = sensor_data.humidity;
                             devices[idx].battery_pct = sensor_data.battery_pct;
@@ -1591,6 +1790,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                             strncpy(devices[idx].firmware_type, sensor_data.device_type, sizeof(devices[idx].firmware_type) - 1);
                             devices[idx].firmware_type[sizeof(devices[idx].firmware_type) - 1] = '\0';
                             devices[idx].has_sensor_data = true;
+                            devices[idx].last_sensor_seen = now_ms;
                         }
                     }
                 }
@@ -1679,13 +1879,12 @@ static esp_err_t api_toggle_visibility_handler(httpd_req_t *req) {
 // API: Poista kaikkien laitteiden näkyvyysvalinnat (myös NVS:stä)
 static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
     int cleared_nvs = 0;
+    int cleared_devices = device_count;
 
-    // Päivitä kaikki laitteet piilotetuiksi muistissa
-    for (int i = 0; i < device_count; i++) {
-        devices[i].visible = false;
-    }
+    // Poista KAIKKI laitteet muistista
+    device_count = 0;
 
-    // Poista kaikki visibility-avaimet NVS:stä (12 hex-merkkiä)
+    // Poista KAIKKI avaimet NVS:stä (paitsi aio_* ja scan_*)
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_iterator_t it = NULL;
@@ -1694,19 +1893,18 @@ static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
             nvs_entry_info_t info;
             nvs_entry_info(it, &info);
 
-            if (strlen(info.key) == 12) {
-                bool is_hex = true;
-                for (int i = 0; i < 12; i++) {
-                    if (!((info.key[i] >= '0' && info.key[i] <= '9') ||
-                          (info.key[i] >= 'A' && info.key[i] <= 'F'))) {
-                        is_hex = false;
-                        break;
-                    }
-                }
-                if (is_hex) {
-                    if (nvs_erase_key(nvs, info.key) == ESP_OK) {
-                        cleared_nvs++;
-                    }
+            // Älä poista aio_* ja scan_* asetuksia
+            bool should_delete = true;
+            if (strncmp(info.key, "aio_", 4) == 0) {
+                should_delete = false;
+            }
+            if (strncmp(info.key, "scan_", 5) == 0) {
+                should_delete = false;
+            }
+
+            if (should_delete) {
+                if (nvs_erase_key(nvs, info.key) == ESP_OK) {
+                    cleared_nvs++;
                 }
             }
 
@@ -1717,8 +1915,10 @@ static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
         nvs_close(nvs);
     }
 
+    ESP_LOGI(TAG, "🗑️ Tyhjennetty muisti: %d laitetta poistettu, %d NVS-avainta poistettu", cleared_devices, cleared_nvs);
+
     char response[128];
-    snprintf(response, sizeof(response), "{\"ok\":true,\"cleared\":%d}", cleared_nvs);
+    snprintf(response, sizeof(response), "{\"ok\":true,\"cleared\":%d,\"nvs_cleared\":%d}", cleared_devices, cleared_nvs);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, response);
     return ESP_OK;
@@ -1757,16 +1957,18 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
     
     ESP_LOGI(TAG, "Update settings request: %s", buf);
     
-    // Parsitaan parametrit: addr, name, show_mac, field_mask, apply_to_similar
+    // Parsitaan parametrit: addr, name, show_mac, show_ip, field_mask, apply_to_similar
     char addr_str[64] = {0};
     char name[MAX_NAME_LEN] = {0};
     int show_mac = 1;
+    int show_ip = 0;
     int field_mask = FIELD_ALL;
     int apply_to_similar = 0;
     
     char *addr_param = strstr(buf, "addr=");
     char *name_param = strstr(buf, "&name=");
     char *show_mac_param = strstr(buf, "&show_mac=");
+    char *show_ip_param = strstr(buf, "&show_ip=");
     char *field_mask_param = strstr(buf, "&field_mask=");
     char *apply_param = strstr(buf, "&apply_to_similar=");
     
@@ -1823,6 +2025,10 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
     if (show_mac_param) {
         sscanf(show_mac_param, "&show_mac=%d", &show_mac);
     }
+
+    if (show_ip_param) {
+        sscanf(show_ip_param, "&show_ip=%d", &show_ip);
+    }
     
     if (field_mask_param) {
         sscanf(field_mask_param, "&field_mask=%d", &field_mask);
@@ -1832,8 +2038,8 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
         sscanf(apply_param, "&apply_to_similar=%d", &apply_to_similar);
     }
     
-    ESP_LOGI(TAG, "Päivitetään laite: %s, name='%s', show_mac=%d, fields=0x%04X, apply=%d",
-             addr_str, name, show_mac, field_mask, apply_to_similar);
+    ESP_LOGI(TAG, "Päivitetään laite: %s, name='%s', show_mac=%d, show_ip=%d, fields=0x%04X, apply=%d",
+             addr_str, name, show_mac, show_ip, field_mask, apply_to_similar);
     
     // Etsi laite
     int target_idx = -1;
@@ -1858,10 +2064,11 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
     // Päivitä laitteen asetukset
     strncpy(devices[target_idx].name, name, MAX_NAME_LEN - 1);
     devices[target_idx].show_mac = (show_mac != 0);
+    devices[target_idx].show_ip = (show_ip != 0);
     devices[target_idx].field_mask = field_mask;
     
     // Tallenna asetukset
-    save_device_settings(devices[target_idx].addr, name, devices[target_idx].show_mac, field_mask);
+    save_device_settings(devices[target_idx].addr, name, devices[target_idx].show_mac, devices[target_idx].show_ip, field_mask);
     
     // Jos apply_to_similar on asetettu, etsi samanlaiset laitteet
     int updated_count = 1;
@@ -1874,10 +2081,11 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
             
             uint16_t sig = get_device_signature(&devices[i]);
             if (sig == target_sig) {
-                // Sovella vain show_mac ja field_mask, ei nimeä!
+                // Sovella vain show_mac, show_ip ja field_mask, ei nimeä!
                 devices[i].show_mac = devices[target_idx].show_mac;
+                devices[i].show_ip = devices[target_idx].show_ip;
                 devices[i].field_mask = devices[target_idx].field_mask;
-                save_device_settings(devices[i].addr, devices[i].name, devices[i].show_mac, field_mask);
+                save_device_settings(devices[i].addr, devices[i].name, devices[i].show_mac, devices[i].show_ip, field_mask);
                 updated_count++;
                 ESP_LOGI(TAG, "  Päivitetty: %02X:%02X:...", devices[i].addr[0], devices[i].addr[1]);
             }
@@ -1954,6 +2162,30 @@ static void start_webserver(void) {
         };
         httpd_register_uri_handler(server, &api_start_scan);
         
+        httpd_uri_t api_stop_scan = {
+            .uri = "/api/stop-scan",
+            .method = HTTP_POST,
+            .handler = api_stop_scan_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_stop_scan);
+        
+        httpd_uri_t api_scan_settings_get = {
+            .uri = "/api/scan-settings",
+            .method = HTTP_GET,
+            .handler = api_scan_settings_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_scan_settings_get);
+        
+        httpd_uri_t api_scan_settings_post = {
+            .uri = "/api/scan-settings",
+            .method = HTTP_POST,
+            .handler = api_scan_settings_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_scan_settings_post);
+        
         httpd_uri_t api_setup = {
             .uri = "/api/setup",
             .method = HTTP_POST,
@@ -2020,6 +2252,12 @@ void app_main() {
     
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        // Lataa master BLE skannauksen asetus
+        uint8_t master_ble_val = 1; // Oletuksena päällä
+        if (nvs_get_u8(nvs, "scan_master", &master_ble_val) == ESP_OK) {
+            master_ble_enabled = (master_ble_val != 0);
+            ESP_LOGI(TAG, "📂 Ladattu asetus: Master BLE skannaus = %s", master_ble_enabled ? "KÄYTÖSSÄ" : "POIS KÄYTÖSTÄ");
+        }
         nvs_close(nvs);
     }
     
@@ -2048,6 +2286,16 @@ void app_main() {
         esp_timer_create(&aio_timer_args, &aio_timer);
         esp_timer_start_periodic(aio_timer, AIO_SEND_INTERVAL_MS * 1000);  // Microsekunteja
         ESP_LOGI(AIO_TAG, "Ajastin käynnistetty, lähetys %d min välein", AIO_SEND_INTERVAL_MS / 60000);
+    }
+
+    // BLE-pakettitaajuuden lokitus
+    if (ble_rate_timer == NULL) {
+        esp_timer_create_args_t rate_timer_args = {
+            .callback = ble_rate_timer_callback,
+            .name = "ble_rate_timer"
+        };
+        esp_timer_create(&rate_timer_args, &ble_rate_timer);
+        esp_timer_start_periodic(ble_rate_timer, BLE_RATE_INTERVAL_MS * 1000);
     }
     
     // BLE vain normaalitilassa, ei setup-modessa
