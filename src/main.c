@@ -552,6 +552,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         ESP_LOGI(WIFI_TAG, "✓ Yhdistetty! IP-osoite: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(WIFI_TAG, "Avaa selaimessa: http://" IPSTR, IP2STR(&event->ip_info.ip));
 #if HAVE_MDNS
+        ESP_LOGI(WIFI_TAG, "mDNS available (HAVE_MDNS=1)");
         if (!mdns_started) {
             esp_err_t err = mdns_init();
             if (err == ESP_OK) {
@@ -563,11 +564,13 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
                 };
                 mdns_service_add("BLE Master", "_http", "_tcp", 80, txt_data, 2);
                 mdns_started = true;
-                ESP_LOGI(WIFI_TAG, "mDNS käynnistetty: http://%s.local", MDNS_HOSTNAME);
+                ESP_LOGI(WIFI_TAG, "✅ mDNS käynnistetty: http://%s.local", MDNS_HOSTNAME);
             } else {
-                ESP_LOGW(WIFI_TAG, "mDNS init epäonnistui: %s", esp_err_to_name(err));
+                ESP_LOGW(WIFI_TAG, "❌ mDNS init epäonnistui: %s", esp_err_to_name(err));
             }
         }
+#else
+        ESP_LOGW(WIFI_TAG, "mDNS NOT available (HAVE_MDNS=0), using UDP broadcast only");
 #endif
     }
 }
@@ -596,6 +599,8 @@ static void discovery_broadcast_task(void *param) {
             int err = sendto(sock, msg, strlen(msg), 0, (struct sockaddr *)&dest, sizeof(dest));
             if (err < 0) {
                 ESP_LOGW(WIFI_TAG, "Discovery broadcast failed");
+            } else {
+                ESP_LOGI(WIFI_TAG, "📡 Discovery broadcast: %s", msg);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(DISCOVERY_INTERVAL_MS));
