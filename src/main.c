@@ -355,9 +355,27 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
         }
         
         if (idx >= 0) {
+            // Tarkista RSSI - päivitä source vain jos uusi signaali on parempi
+            bool update_source = false;
+            if (devices[idx].rssi == 0) {
+                // Ensimmäinen havainto, hyväksy aina
+                update_source = true;
+            } else if (event->disc.rssi > devices[idx].rssi) {
+                // Uusi RSSI on parempi (vähemmän negatiivinen)
+                update_source = true;
+                ESP_LOGI(TAG, "📶 Parempi signaali: %d dBm > %d dBm, vaihdetaan lähteeksi local", 
+                         event->disc.rssi, devices[idx].rssi);
+            }
+            
+            // Päivitä RSSI ja aikaleima aina
             devices[idx].rssi = event->disc.rssi;
             uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
             devices[idx].last_seen = now_ms;
+            
+            // Päivitä source vain jos RSSI parani
+            if (update_source) {
+                strcpy(devices[idx].source, "local");
+            }
             if (devices[idx].last_adv_seen > 0 && now_ms >= devices[idx].last_adv_seen) {
                 uint32_t delta = now_ms - devices[idx].last_adv_seen;
                 devices[idx].adv_interval_ms_last = delta;
@@ -382,6 +400,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                     int copy_len = (fields.name_len < MAX_NAME_LEN - 1) ? fields.name_len : MAX_NAME_LEN - 1;
                     memcpy(devices[idx].adv_name, fields.name, copy_len);
                     devices[idx].adv_name[copy_len] = '\0';
+                    // Päivitä name vain jos tyhjä (käyttäjä ei ole asettanut omaa)
                     if (devices[idx].name[0] == '\0') {
                         memcpy(devices[idx].name, fields.name, copy_len);
                         devices[idx].name[copy_len] = '\0';
@@ -1678,11 +1697,25 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
         
         if (idx >= 0) {
             sat_adv_count++;
-            // Päivitä source jos oli tyhjä tai "local" (muuttui satelliitiksi)
-            if (strlen(devices[idx].source) == 0 || strcmp(devices[idx].source, "local") == 0) {
+            
+            // Tarkista RSSI - päivitä source vain jos uusi signaali on parempi
+            bool update_source = false;
+            if (devices[idx].rssi == 0) {
+                // Ensimmäinen havainto, hyväksy aina
+                update_source = true;
+            } else if (rssi > devices[idx].rssi) {
+                // Uusi RSSI on parempi (vähemmän negatiivinen)
+                update_source = true;
+                ESP_LOGI(TAG, "📶 Parempi signaali: %d dBm > %d dBm, vaihdetaan lähteeksi satellite-%s", 
+                         rssi, devices[idx].rssi, client_ip);
+            }
+            
+            // Päivitä source vain jos RSSI parani
+            if (update_source) {
                 snprintf(devices[idx].source, sizeof(devices[idx].source), "satellite-%s", client_ip);
             }
             
+            // Päivitä RSSI ja aikaleima aina
             devices[idx].rssi = rssi;
             uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
             devices[idx].last_seen = now_ms;
@@ -1721,9 +1754,25 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                     int copy_len = (fields.name_len < MAX_NAME_LEN - 1) ? fields.name_len : MAX_NAME_LEN - 1;
                     memcpy(devices[idx].adv_name, fields.name, copy_len);
                     devices[idx].adv_name[copy_len] = '\0';
-                    if (devices[idx].name[0] == '\0' || strncmp(devices[idx].name, "Sat-", 4) == 0) {
+                    // Päivitä name jos tyhjä, alkaa "Sat-", tai on sama kuin MAC-osoite
+                    bool should_update_name = false;
+                    if (devices[idx].name[0] == '\0') {
+                        should_update_name = true;
+                    } else if (strncmp(devices[idx].name, "Sat-", 4) == 0) {
+                        should_update_name = true;
+                    } else {
+                        // Tarkista onko nimi vain MAC-osoite muodossa XX:XX:XX:XX:XX:XX
+                        char mac_as_name[18];
+                        snprintf(mac_as_name, sizeof(mac_as_name), "%02X:%02X:%02X:%02X:%02X:%02X",
+                                mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+                        if (strcmp(devices[idx].name, mac_as_name) == 0) {
+                            should_update_name = true;
+                        }
+                    }
+                    if (should_update_name) {
                         memcpy(devices[idx].name, fields.name, copy_len);
                         devices[idx].name[copy_len] = '\0';
+                        ESP_LOGI(TAG, "  ✏️ Updated name to: %s", devices[idx].name);
                     }
                 }
                 
