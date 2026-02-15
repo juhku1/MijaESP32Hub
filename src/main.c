@@ -1748,6 +1748,12 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
             ESP_LOGI(TAG, "  🔍 Parse fields result: %d, data_len: %d", parse_result, data_len);
             
             if (parse_result == 0) {
+                bool has_svc16 = (fields.svc_data_uuid16 != NULL && fields.svc_data_uuid16_len > 0);
+                bool has_mfg = (fields.mfg_data != NULL && fields.mfg_data_len > 0);
+                ESP_LOGI(TAG, "  📦 Payload: svc16=%s len=%d, mfg=%s len=%d",
+                         has_svc16 ? "yes" : "no", fields.svc_data_uuid16_len,
+                         has_mfg ? "yes" : "no", fields.mfg_data_len);
+
                 // Copy device name if user hasn't set custom name
                 if (fields.name != NULL && fields.name_len > 0) {
                     ESP_LOGI(TAG, "  📛 Device name found: len=%d", fields.name_len);
@@ -1774,6 +1780,8 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                         devices[idx].name[copy_len] = '\0';
                         ESP_LOGI(TAG, "  ✏️ Updated name to: %s", devices[idx].name);
                     }
+                } else {
+                    ESP_LOGI(TAG, "  📛 No device name in adv/scan response");
                 }
                 
                 // Parse sensor data (pvvx/ATC format UUID 0x181A, MiBeacon UUID 0xFE95, or BTHome v2 UUID 0xFCD2)
