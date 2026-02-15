@@ -12,7 +12,12 @@
 #include "driver/gpio.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#if __has_include("mdns.h")
 #include "mdns.h"
+#define HAVE_MDNS 1
+#else
+#define HAVE_MDNS 0
+#endif
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -81,7 +86,9 @@ static char wifi_ssid[64] = {0};
 static char wifi_password[64] = {0};
 static bool wifi_connected = false;
 static char master_ip[16] = {0};
+#if HAVE_MDNS
 static bool mdns_started = false;
+#endif
 static char aio_username[64] = {0};
 static char aio_key[128] = {0};
 static bool aio_enabled = false;
@@ -544,6 +551,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         snprintf(master_ip, sizeof(master_ip), IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(WIFI_TAG, "✓ Yhdistetty! IP-osoite: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(WIFI_TAG, "Avaa selaimessa: http://" IPSTR, IP2STR(&event->ip_info.ip));
+#if HAVE_MDNS
         if (!mdns_started) {
             esp_err_t err = mdns_init();
             if (err == ESP_OK) {
@@ -560,6 +568,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
                 ESP_LOGW(WIFI_TAG, "mDNS init epäonnistui: %s", esp_err_to_name(err));
             }
         }
+#endif
     }
 }
 
