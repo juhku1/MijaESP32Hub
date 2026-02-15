@@ -1627,6 +1627,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
     char mac_str[18] = {0};
     int rssi = 0;
     char hex_data[256] = {0};
+    char json_name[64] = {0};
     
     char *p = strstr(buf, "\"mac\":\"");
     if (p) {
@@ -1648,6 +1649,16 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
         char *end = strchr(p, '"');
         if (end && (end - p) < 256) {
             memcpy(hex_data, p, end - p);
+        }
+    }
+
+    p = strstr(buf, "\"name\":\"");
+    if (p) {
+        p += 8;
+        char *end = strchr(p, '"');
+        if (end && (end - p) < (int)sizeof(json_name)) {
+            memcpy(json_name, p, end - p);
+            json_name[end - p] = '\0';
         }
     }
     
@@ -1748,6 +1759,33 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
             ESP_LOGI(TAG, "  🔍 Parse fields result: %d, data_len: %d", parse_result, data_len);
             
             if (parse_result == 0) {
+                if (json_name[0] != '\0') {
+                    int copy_len = (strlen(json_name) < MAX_NAME_LEN - 1) ? (int)strlen(json_name) : MAX_NAME_LEN - 1;
+                    if (devices[idx].adv_name[0] == '\0') {
+                        memcpy(devices[idx].adv_name, json_name, copy_len);
+                        devices[idx].adv_name[copy_len] = '\0';
+                    }
+                    // Päivitä name jos tyhjä, alkaa "Sat-", tai on sama kuin MAC-osoite
+                    bool should_update_name = false;
+                    if (devices[idx].name[0] == '\0') {
+                        should_update_name = true;
+                    } else if (strncmp(devices[idx].name, "Sat-", 4) == 0) {
+                        should_update_name = true;
+                    } else {
+                        char mac_as_name[18];
+                        snprintf(mac_as_name, sizeof(mac_as_name), "%02X:%02X:%02X:%02X:%02X:%02X",
+                                mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+                        if (strcmp(devices[idx].name, mac_as_name) == 0) {
+                            should_update_name = true;
+                        }
+                    }
+                    if (should_update_name) {
+                        memcpy(devices[idx].name, json_name, copy_len);
+                        devices[idx].name[copy_len] = '\0';
+                        ESP_LOGI(TAG, "  ✏️ Updated name from satellite JSON: %s", devices[idx].name);
+                    }
+                }
+
                 bool has_svc16 = (fields.svc_data_uuid16 != NULL && fields.svc_data_uuid16_len > 0);
                 bool has_mfg = (fields.mfg_data != NULL && fields.mfg_data_len > 0);
                 ESP_LOGI(TAG, "  📦 Payload: svc16=%s len=%d, mfg=%s len=%d",
