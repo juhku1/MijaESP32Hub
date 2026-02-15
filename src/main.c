@@ -524,7 +524,14 @@ static void ble_app_on_sync(void) {
     disc_params.window = 0x30;  // 48 * 0.625ms = 30ms window (60% duty cycle)
     disc_params.passive = 0;  // Active scan jotta saadaan scan response (nimi)
     
-    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params, ble_gap_event, NULL);
+    uint8_t addr_type;
+    int rc = ble_hs_id_infer_auto(0, &addr_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE addr_type infer epäonnistui: %d", rc);
+        return;
+    }
+
+    rc = ble_gap_disc(addr_type, BLE_HS_FOREVER, &disc_params, ble_gap_event, NULL);
     
     if (rc != 0) {
         ESP_LOGE(TAG, "Jatkuvan skannauksen käynnistys epäonnistui: %d", rc);
@@ -551,6 +558,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         snprintf(master_ip, sizeof(master_ip), IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(WIFI_TAG, "✓ Yhdistetty! IP-osoite: " IPSTR, IP2STR(&event->ip_info.ip));
         ESP_LOGI(WIFI_TAG, "Avaa selaimessa: http://" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(WIFI_TAG, "Discovery-broadcast valmis (portti %d, 5 s välein)", DISCOVERY_PORT);
 #if HAVE_MDNS
         ESP_LOGI(WIFI_TAG, "mDNS available (HAVE_MDNS=1)");
         if (!mdns_started) {
@@ -565,6 +573,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
                 mdns_service_add("BLE Master", "_http", "_tcp", 80, txt_data, 2);
                 mdns_started = true;
                 ESP_LOGI(WIFI_TAG, "✅ mDNS käynnistetty: http://%s.local", MDNS_HOSTNAME);
+                ESP_LOGI(WIFI_TAG, "mDNS service: _http._tcp port 80, txt(role=master, path=/api/satellite-data)");
             } else {
                 ESP_LOGW(WIFI_TAG, "❌ mDNS init epäonnistui: %s", esp_err_to_name(err));
             }
@@ -602,6 +611,9 @@ static void discovery_broadcast_task(void *param) {
             } else {
                 ESP_LOGI(WIFI_TAG, "📡 Discovery broadcast: %s", msg);
             }
+        } else {
+            ESP_LOGW(WIFI_TAG, "Discovery broadcast skipped (wifi_connected=%d, master_ip='%s')",
+                     wifi_connected ? 1 : 0, master_ip);
         }
         vTaskDelay(pdMS_TO_TICKS(DISCOVERY_INTERVAL_MS));
     }
@@ -1692,7 +1704,10 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
         if (end && (end - p) < (int)sizeof(json_name)) {
             memcpy(json_name, p, end - p);
             json_name[end - p] = '\0';
+            ESP_LOGI(TAG, "  📛 Satellite JSON name: '%s'", json_name);
         }
+    } else {
+        ESP_LOGI(TAG, "  📛 Satellite JSON name: (none)");
     }
     
     // Parse MAC address (satelliitti käyttää normaalia järjestystä)
