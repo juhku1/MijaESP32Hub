@@ -58,6 +58,7 @@ typedef struct {
     bool visible;  // Näkyykö laite
     char name[MAX_NAME_LEN];
     char adv_name[MAX_NAME_LEN];  // Mainosnimi (BLE-advertisement)
+    bool user_named;  // Onko käyttäjä antanut oman nimen
     bool show_mac;  // Näytetäänkö MAC-osoite
     bool show_ip;  // Näytetäänkö satelliitti-IP
     uint16_t field_mask;  // Bitmask: mitä kenttiä näytetään (temp, hum, bat, batMv, rssi)
@@ -108,7 +109,7 @@ static bool allow_new_devices = false;  // Sallitaanko uusien laitteiden lisää
 static bool master_ble_enabled = true;  // Onko paikallinen BLE-skannaus käytössä (vai vain satelliitit)
 
 // Tallenna laitteen asetukset NVS:ään
-static void save_device_settings(uint8_t *addr, const char *name, bool show_mac, bool show_ip, uint16_t field_mask) {
+static void save_device_settings(uint8_t *addr, const char *name, bool show_mac, bool show_ip, uint16_t field_mask, bool user_named) {
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         char base_key[20];
@@ -121,6 +122,11 @@ static void save_device_settings(uint8_t *addr, const char *name, bool show_mac,
             snprintf(name_key, sizeof(name_key), "%s_n", base_key);
             nvs_set_str(nvs, name_key, name);
         }
+
+        // Tallenna user_named
+        char user_key[24];
+        snprintf(user_key, sizeof(user_key), "%s_u", base_key);
+        nvs_set_u8(nvs, user_key, user_named ? 1 : 0);
         
         // Tallenna show_mac
         char mac_key[24];
@@ -139,19 +145,20 @@ static void save_device_settings(uint8_t *addr, const char *name, bool show_mac,
         
         nvs_commit(nvs);
         nvs_close(nvs);
-        ESP_LOGI(TAG, "Tallennettu asetukset: %s, name=%s, show_mac=%d, show_ip=%d, fields=0x%04X", 
-             base_key, name, show_mac, show_ip, field_mask);
+        ESP_LOGI(TAG, "Tallennettu asetukset: %s, name=%s, user_named=%d, show_mac=%d, show_ip=%d, fields=0x%04X", 
+             base_key, name, user_named ? 1 : 0, show_mac, show_ip, field_mask);
     }
 }
 
 // Lataa laitteen asetukset NVS:stä
-    static void load_device_settings(uint8_t *addr, char *name_out, bool *show_mac_out, bool *show_ip_out, uint16_t *field_mask_out) {
+static void load_device_settings(uint8_t *addr, char *name_out, bool *show_mac_out, bool *show_ip_out, uint16_t *field_mask_out, bool *user_named_out) {
     nvs_handle_t nvs;
     // Oletusarvot
     name_out[0] = '\0';
     *show_mac_out = true;
     *show_ip_out = false;
     *field_mask_out = FIELD_ALL;
+    *user_named_out = false;
     
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
         char base_key[20];
@@ -163,6 +170,17 @@ static void save_device_settings(uint8_t *addr, const char *name, bool show_mac,
         snprintf(name_key, sizeof(name_key), "%s_n", base_key);
         size_t name_len = MAX_NAME_LEN;
         nvs_get_str(nvs, name_key, name_out, &name_len);
+
+        // Lataa user_named
+        char user_key[24];
+        snprintf(user_key, sizeof(user_key), "%s_u", base_key);
+        uint8_t user_named_val = 0;
+        if (nvs_get_u8(nvs, user_key, &user_named_val) == ESP_OK) {
+            *user_named_out = user_named_val ? true : false;
+        } else if (name_out[0] != '\0') {
+            // Taaksepäin yhteensopivuus: jos nimi on tallennettu, oletetaan käyttäjän antamaksi
+            *user_named_out = true;
+        }
         
         // Lataa show_mac
         char mac_key[24];
@@ -273,9 +291,10 @@ static void load_all_devices_from_nvs(void) {
                 
                 // Lataa muut asetukset
                 load_device_settings(addr, devices[device_count].name,
-                                   &devices[device_count].show_mac,
-                                   &devices[device_count].show_ip,
-                                   &devices[device_count].field_mask);
+                            &devices[device_count].show_mac,
+                            &devices[device_count].show_ip,
+                            &devices[device_count].field_mask,
+                            &devices[device_count].user_named);
                 
                 ESP_LOGI(TAG, "  Ladattu laite %d: %02X:%02X:%02X:%02X:%02X:%02X, name=%s",
                         device_count,
@@ -326,9 +345,10 @@ static int find_or_add_device(uint8_t *addr, bool allow_adding_new) {
         
         // Lataa tallennetut asetukset (nimi, show_mac, field_mask)
         load_device_settings(addr, devices[device_count].name, 
-                   &devices[device_count].show_mac,
-                   &devices[device_count].show_ip,
-                   &devices[device_count].field_mask);
+               &devices[device_count].show_mac,
+               &devices[device_count].show_ip,
+               &devices[device_count].field_mask,
+               &devices[device_count].user_named);
         
         // Lataa visibility NVS:stä (jos tallennettu)
         devices[device_count].visible = load_visibility(addr);
@@ -359,33 +379,19 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                  event->disc.addr.val[2], event->disc.addr.val[1], event->disc.addr.val[0],
                  event->disc.rssi, event->disc.length_data);
         
-        // Jos laite ei ole listassa tai ei ole näkyvissä (ja ei olla discovery-modessa), ohita
-        if (idx < 0 || (!allow_new_devices && !devices[idx].visible)) {
-            return 0;  // Ei päivitetä piilotettuja laitteita monitoring-modessa
+        // Jos laite ei ole listassa, ohita (uusia ei lisätä monitoring-modessa)
+        if (idx < 0) {
+            return 0;
         }
         
         if (idx >= 0) {
-            // Tarkista RSSI - päivitä source vain jos uusi signaali on parempi
-            bool update_source = false;
-            if (devices[idx].rssi == 0) {
-                // Ensimmäinen havainto, hyväksy aina
-                update_source = true;
-            } else if (event->disc.rssi > devices[idx].rssi) {
-                // Uusi RSSI on parempi (vähemmän negatiivinen)
-                update_source = true;
-                ESP_LOGI(TAG, "📶 Parempi signaali: %d dBm > %d dBm, vaihdetaan lähteeksi local", 
-                         event->disc.rssi, devices[idx].rssi);
-            }
-            
             // Päivitä RSSI ja aikaleima aina
             devices[idx].rssi = event->disc.rssi;
             uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
             devices[idx].last_seen = now_ms;
             
-            // Päivitä source vain jos RSSI parani
-            if (update_source) {
-                strcpy(devices[idx].source, "local");
-            }
+            // Lähde = paikallinen aina kun paikallinen havainto tulee
+            strcpy(devices[idx].source, "local");
             if (devices[idx].last_adv_seen > 0 && now_ms >= devices[idx].last_adv_seen) {
                 uint32_t delta = now_ms - devices[idx].last_adv_seen;
                 devices[idx].adv_interval_ms_last = delta;
@@ -401,12 +407,17 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
             }
             devices[idx].last_adv_seen = now_ms;
             
+            // Jos laite on piilotettu ja discovery-mode pois, ei päivitetä mainosnimeä/sensoridataa
+            if (!allow_new_devices && !devices[idx].visible) {
+                return 0;
+            }
+
             // Parsitaan mainosdata
             struct ble_hs_adv_fields fields;
             if (ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data) == 0) {
                 
-                // Laitteen nimi (kopioidaan vain jos käyttäjä ei ole asettanut omaa nimeä)
-                if (fields.name != NULL && fields.name_len > 0) {
+                // Mainosnimi (adv_name) päivittyy vain jos käyttäjä ei ole antanut omaa nimeä
+                if (!devices[idx].user_named && fields.name != NULL && fields.name_len > 0) {
                     int copy_len = (fields.name_len < MAX_NAME_LEN - 1) ? fields.name_len : MAX_NAME_LEN - 1;
                     memcpy(devices[idx].adv_name, fields.name, copy_len);
                     devices[idx].adv_name[copy_len] = '\0';
@@ -1739,7 +1750,8 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
             load_device_settings(mac_addr, devices[idx].name,
                                &devices[idx].show_mac,
                                &devices[idx].show_ip,
-                               &devices[idx].field_mask);
+                               &devices[idx].field_mask,
+                               &devices[idx].user_named);
             if (devices[idx].name[0] == '\0') {
                 snprintf(devices[idx].name, MAX_NAME_LEN, "Sat-%02X%02X", mac_addr[4], mac_addr[5]);
             }
@@ -1757,22 +1769,8 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
         if (idx >= 0) {
             sat_adv_count++;
             
-            // Tarkista RSSI - päivitä source vain jos uusi signaali on parempi
-            bool update_source = false;
-            if (devices[idx].rssi == 0) {
-                // Ensimmäinen havainto, hyväksy aina
-                update_source = true;
-            } else if (rssi > devices[idx].rssi) {
-                // Uusi RSSI on parempi (vähemmän negatiivinen)
-                update_source = true;
-                ESP_LOGI(TAG, "📶 Parempi signaali: %d dBm > %d dBm, vaihdetaan lähteeksi satellite-%s", 
-                         rssi, devices[idx].rssi, client_ip);
-            }
-            
-            // Päivitä source vain jos RSSI parani
-            if (update_source) {
-                snprintf(devices[idx].source, sizeof(devices[idx].source), "satellite-%s", client_ip);
-            }
+            // Lähde = satelliitti aina kun satelliittihavainto tulee
+            snprintf(devices[idx].source, sizeof(devices[idx].source), "satellite-%s", client_ip);
             
             // Päivitä RSSI ja aikaleima aina
             devices[idx].rssi = rssi;
@@ -1807,23 +1805,24 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
             ESP_LOGI(TAG, "  🔍 Parse fields result: %d, data_len: %d", parse_result, data_len);
             
             if (parse_result == 0) {
+                // Mainosnimi (adv_name) päivittyy vain jos käyttäjä ei ole antanut omaa nimeä
                 if (json_name[0] != '\0') {
                     int copy_len = (strlen(json_name) < MAX_NAME_LEN - 1) ? (int)strlen(json_name) : MAX_NAME_LEN - 1;
-                    if (devices[idx].adv_name[0] == '\0') {
+                    if (!devices[idx].user_named) {
                         memcpy(devices[idx].adv_name, json_name, copy_len);
                         devices[idx].adv_name[copy_len] = '\0';
                     }
                     // Päivitä name jos tyhjä, alkaa "Sat-", tai on sama kuin MAC-osoite
                     bool should_update_name = false;
-                    if (devices[idx].name[0] == '\0') {
+                    if (!devices[idx].user_named && devices[idx].name[0] == '\0') {
                         should_update_name = true;
-                    } else if (strncmp(devices[idx].name, "Sat-", 4) == 0) {
+                    } else if (!devices[idx].user_named && strncmp(devices[idx].name, "Sat-", 4) == 0) {
                         should_update_name = true;
                     } else {
                         char mac_as_name[18];
                         snprintf(mac_as_name, sizeof(mac_as_name), "%02X:%02X:%02X:%02X:%02X:%02X",
                                 mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-                        if (strcmp(devices[idx].name, mac_as_name) == 0) {
+                        if (!devices[idx].user_named && strcmp(devices[idx].name, mac_as_name) == 0) {
                             should_update_name = true;
                         }
                     }
@@ -1844,20 +1843,22 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                 if (fields.name != NULL && fields.name_len > 0) {
                     ESP_LOGI(TAG, "  📛 Device name found: len=%d", fields.name_len);
                     int copy_len = (fields.name_len < MAX_NAME_LEN - 1) ? fields.name_len : MAX_NAME_LEN - 1;
-                    memcpy(devices[idx].adv_name, fields.name, copy_len);
-                    devices[idx].adv_name[copy_len] = '\0';
+                    if (!devices[idx].user_named) {
+                        memcpy(devices[idx].adv_name, fields.name, copy_len);
+                        devices[idx].adv_name[copy_len] = '\0';
+                    }
                     // Päivitä name jos tyhjä, alkaa "Sat-", tai on sama kuin MAC-osoite
                     bool should_update_name = false;
-                    if (devices[idx].name[0] == '\0') {
+                    if (!devices[idx].user_named && devices[idx].name[0] == '\0') {
                         should_update_name = true;
-                    } else if (strncmp(devices[idx].name, "Sat-", 4) == 0) {
+                    } else if (!devices[idx].user_named && strncmp(devices[idx].name, "Sat-", 4) == 0) {
                         should_update_name = true;
                     } else {
                         // Tarkista onko nimi vain MAC-osoite muodossa XX:XX:XX:XX:XX:XX
                         char mac_as_name[18];
                         snprintf(mac_as_name, sizeof(mac_as_name), "%02X:%02X:%02X:%02X:%02X:%02X",
                                 mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-                        if (strcmp(devices[idx].name, mac_as_name) == 0) {
+                        if (!devices[idx].user_named && strcmp(devices[idx].name, mac_as_name) == 0) {
                             should_update_name = true;
                         }
                     }
@@ -2022,12 +2023,19 @@ static esp_err_t api_toggle_visibility_handler(httpd_req_t *req) {
 // API: Poista kaikkien laitteiden näkyvyysvalinnat (myös NVS:stä)
 static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
     int cleared_nvs = 0;
-    int cleared_devices = device_count;
+    int cleared_devices = 0;
 
-    // Poista KAIKKI laitteet muistista
-    device_count = 0;
+    // Piilota kaikki laitteet, älä poista listaa
+    for (int i = 0; i < device_count; i++) {
+        if (devices[i].visible) {
+            devices[i].visible = false;
+            cleared_devices++;
+        } else {
+            devices[i].visible = false;
+        }
+    }
 
-    // Poista KAIKKI avaimet NVS:stä (paitsi aio_* ja scan_*)
+    // Poista vain näkyvyysavaimet NVS:stä (12 hex-merkkiä)
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_iterator_t it = NULL;
@@ -2036,18 +2044,19 @@ static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
             nvs_entry_info_t info;
             nvs_entry_info(it, &info);
 
-            // Älä poista aio_* ja scan_* asetuksia
-            bool should_delete = true;
-            if (strncmp(info.key, "aio_", 4) == 0) {
-                should_delete = false;
-            }
-            if (strncmp(info.key, "scan_", 5) == 0) {
-                should_delete = false;
-            }
-
-            if (should_delete) {
-                if (nvs_erase_key(nvs, info.key) == ESP_OK) {
-                    cleared_nvs++;
+            if (strlen(info.key) == 12) {
+                bool is_hex = true;
+                for (int i = 0; i < 12; i++) {
+                    if (!((info.key[i] >= '0' && info.key[i] <= '9') ||
+                          (info.key[i] >= 'A' && info.key[i] <= 'F'))) {
+                        is_hex = false;
+                        break;
+                    }
+                }
+                if (is_hex) {
+                    if (nvs_erase_key(nvs, info.key) == ESP_OK) {
+                        cleared_nvs++;
+                    }
                 }
             }
 
@@ -2058,7 +2067,7 @@ static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
         nvs_close(nvs);
     }
 
-    ESP_LOGI(TAG, "🗑️ Tyhjennetty muisti: %d laitetta poistettu, %d NVS-avainta poistettu", cleared_devices, cleared_nvs);
+    ESP_LOGI(TAG, "🗑️ Näkyvyys nollattu: %d laitetta piilotettu, %d NVS-avainta poistettu", cleared_devices, cleared_nvs);
 
     char response[128];
     snprintf(response, sizeof(response), "{\"ok\":true,\"cleared\":%d,\"nvs_cleared\":%d}", cleared_devices, cleared_nvs);
@@ -2209,9 +2218,10 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
     devices[target_idx].show_mac = (show_mac != 0);
     devices[target_idx].show_ip = (show_ip != 0);
     devices[target_idx].field_mask = field_mask;
+    devices[target_idx].user_named = (name[0] != '\0');
     
     // Tallenna asetukset
-    save_device_settings(devices[target_idx].addr, name, devices[target_idx].show_mac, devices[target_idx].show_ip, field_mask);
+    save_device_settings(devices[target_idx].addr, name, devices[target_idx].show_mac, devices[target_idx].show_ip, field_mask, devices[target_idx].user_named);
     
     // Jos apply_to_similar on asetettu, etsi samanlaiset laitteet
     int updated_count = 1;
@@ -2228,7 +2238,7 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
                 devices[i].show_mac = devices[target_idx].show_mac;
                 devices[i].show_ip = devices[target_idx].show_ip;
                 devices[i].field_mask = devices[target_idx].field_mask;
-                save_device_settings(devices[i].addr, devices[i].name, devices[i].show_mac, devices[i].show_ip, field_mask);
+                save_device_settings(devices[i].addr, devices[i].name, devices[i].show_mac, devices[i].show_ip, field_mask, devices[i].user_named);
                 updated_count++;
                 ESP_LOGI(TAG, "  Päivitetty: %02X:%02X:...", devices[i].addr[0], devices[i].addr[1]);
             }
@@ -2240,6 +2250,76 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
     char response[128];
     snprintf(response, sizeof(response), "{\"ok\":true,\"updated\":%d}", updated_count);
     httpd_resp_sendstr(req, response);
+    return ESP_OK;
+}
+
+// PWA: manifest
+static esp_err_t manifest_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "application/manifest+json");
+    const char *manifest =
+        "{"
+        "\"name\":\"BLE Laitteet\","
+        "\"short_name\":\"BLE Hub\","
+        "\"start_url\":\"/\","
+        "\"display\":\"standalone\","
+        "\"background_color\":\"#0f172a\","
+        "\"theme_color\":\"#0f172a\","
+        "\"icons\":["
+        "{\"src\":\"/icon-192.png\",\"sizes\":\"192x192\",\"type\":\"image/png\"},"
+        "{\"src\":\"/icon-512.png\",\"sizes\":\"512x512\",\"type\":\"image/png\"},"
+        "{\"src\":\"/icon.svg\",\"sizes\":\"any\",\"type\":\"image/svg+xml\"}"
+        "]"
+        "}";
+    httpd_resp_sendstr(req, manifest);
+    return ESP_OK;
+}
+
+// PWA: service worker (network-only, no caching)
+static esp_err_t sw_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "application/javascript");
+    const char *sw =
+        "self.addEventListener('install',e=>{self.skipWaiting();});"
+        "self.addEventListener('activate',e=>{e.waitUntil(self.clients.claim());});"
+        "self.addEventListener('fetch',e=>{"
+        "e.respondWith(fetch(e.request,{cache:'no-store'}));"
+        "});";
+    httpd_resp_sendstr(req, sw);
+    return ESP_OK;
+}
+
+// PWA: simple SVG icon
+static esp_err_t icon_svg_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "image/svg+xml");
+    const char *svg =
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'>"
+        "<rect width='128' height='128' rx='24' fill='#0f172a'/>"
+        "<path d='M64 20c-16.6 0-30 13.4-30 30v8h12v-8c0-9.9 8.1-18 18-18s18 8.1 18 18v8h12v-8c0-16.6-13.4-30-30-30z' fill='#3b82f6'/>"
+        "<circle cx='64' cy='74' r='26' fill='#1e293b' stroke='#3b82f6' stroke-width='6'/>"
+        "<circle cx='64' cy='74' r='6' fill='#60a5fa'/>"
+        "</svg>";
+    httpd_resp_sendstr(req, svg);
+    return ESP_OK;
+}
+
+// PWA: PNG icon (1x1 transparent, scaled by OS)
+static esp_err_t icon_png_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "image/png");
+    static const uint8_t icon_png[] = {
+        0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
+        0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,
+        0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,
+        0x08,0x04,0x00,0x00,0x00,0xB5,0x1C,0x0C,
+        0x02,0x00,0x00,0x00,0x0B,0x49,0x44,0x41,
+        0x54,0x78,0x9C,0x63,0x60,0x00,0x00,0x00,
+        0x02,0x00,0x01,0x4C,0x49,0x8C,0x02,0x00,
+        0x00,0x00,0x00,0x49,0x45,0x4E,0x44,0xAE,
+        0x42,0x60,0x82
+    };
+    httpd_resp_send(req, (const char *)icon_png, sizeof(icon_png));
     return ESP_OK;
 }
 
@@ -2256,6 +2336,46 @@ static void start_webserver(void) {
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &root);
+
+        httpd_uri_t manifest = {
+            .uri = "/manifest.json",
+            .method = HTTP_GET,
+            .handler = manifest_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &manifest);
+
+        httpd_uri_t sw = {
+            .uri = "/sw.js",
+            .method = HTTP_GET,
+            .handler = sw_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &sw);
+
+        httpd_uri_t icon_svg = {
+            .uri = "/icon.svg",
+            .method = HTTP_GET,
+            .handler = icon_svg_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &icon_svg);
+
+        httpd_uri_t icon_192 = {
+            .uri = "/icon-192.png",
+            .method = HTTP_GET,
+            .handler = icon_png_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &icon_192);
+
+        httpd_uri_t icon_512 = {
+            .uri = "/icon-512.png",
+            .method = HTTP_GET,
+            .handler = icon_png_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &icon_512);
         
         httpd_uri_t api_devices = {
             .uri = "/api/devices",
