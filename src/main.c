@@ -1256,6 +1256,8 @@ static esp_err_t api_aio_send_now_handler(httpd_req_t *req) {
 // ============================================
 
 static esp_err_t root_get_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
     if (setup_mode) {
         httpd_resp_send(req, SETUP_HTML_PAGE, HTTPD_RESP_USE_STRLEN);
     } else {
