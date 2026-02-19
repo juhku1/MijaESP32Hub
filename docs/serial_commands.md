@@ -1,25 +1,25 @@
-# Serial monitor - pikaopas (PlatformIO)
+# Serial monitor quick guide (PlatformIO)
 
-## Käynnistys
+## Start
 - **Serial monitor (115200):**
   - `pio device monitor -b 115200`
-- **Serial monitor tietylle portille:**
+- **Serial monitor for a specific port:**
   - `pio device monitor -p /dev/ttyUSB0 -b 115200`
 
 ## Upload (firmware)
 - **Build + upload (esp32-s3-devkitc-1):**
-  - pio run -e esp32-s3-devkitc-1 -t upload
-  pio device monitor -p /dev/ttyACM0 -b 115200
+  - `pio run -e esp32-s3-devkitc-1 -t upload`
+  - `pio device monitor -p /dev/ttyACM0 -b 115200`
 
-## Portin sulkeminen
-- **Pysäytä monitori:**
+## Close the port
+- **Stop the monitor:**
   - `Ctrl + C`
 
-## Portin listaus ja tarkistus
-- **Listaa laitteet/portit:**
+## List ports
+- **List devices/ports:**
   - `pio device list`
 
-## Yleisiä vinkkejä
-- Jos portti on varattu, sulje kaikki muut ohjelmat, jotka käyttävät samaa sarjaporttia.
-- Varmista oikea baudinopeus (yleensä 115200).
-- Jos laite ei näy, irrota ja kytke USB-kaapeli uudelleen.
+## Tips
+- If the port is busy, close other programs using the same serial port.
+- Make sure the baud rate is correct (usually 115200).
+- If the device does not show up, unplug and reconnect the USB cable.

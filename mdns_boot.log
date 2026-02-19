@@ -1,0 +1,15 @@
+--- Terminal on /dev/ttyACM2 | 115200 8-N-1
+--- Available filters and text transformations: debug, default, direct, esp32_exception_decoder, hexlify, log2file, nocontrol, printable, send_on_enter, time
+--- More details at https://bit.ly/pio-monitor-filters
+--- Quit: Ctrl+C | Menu: Ctrl+T | Help: Ctrl+T followed by Ctrl+H
+19:23:26.572 > I (304) esp_image: segment 4: paddr=00139650 vaddr=4037a260 sizeI (2381) WiFi: ✓ Yhdistetty! IP-osoite: 192.168.68.144
+19:23:26.572 > I (2381) WiFi: Avaa selaimessa: http://192.168.68.144
+19:23:26.577 > I (2381) WiFi: Discovery-broadcast valmis (portti 19798, 5 s välein)
+19:23:26.580 > I (2381) WiFi: mDNS available (HAVE_MDNS=1)
+19:23:26.592 > I (2391) mdns_mem: mDNS task will be created from internal RAM
+19:23:26.592 > I (2391) WiFi: ✅ mDNS käynnistetty: http://ble-master.local
+19:23:26.600 > I (2401) WiFi: mDNS service: _http._tcp port 80, txt(role=master, path=/api/satellite-data)
+19:23:26.609 > I (2401) esp_netif_handlers: sta ip: 192.168.68.144, mask: 255.255.255.0, gw: 192.168.68.1
+19:23:29.923 > I (5731) WiFi: 📡 Discovery broadcast: SATMASTER 192.168.68.144 80
+19:23:34.923 > I (10731) WiFi: 📡 Discovery broadcast: SATMASTER 192.168.68.144 80
+19:23:34.944 > I (10751) BLE_SCAN: BLE rate: adv=0.0/s sensor=0.0/s | sat adv=0.0/s sensor=0.0/s

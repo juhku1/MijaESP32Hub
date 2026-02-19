@@ -4,6 +4,26 @@
 
 ESP32‑S3 BLE hub that scans BLE advertisements, parses sensor data, and exposes everything via a web UI and HTTP API. The system can be extended with ESP32‑C3 satellites that scan BLE and forward data to the hub.
 
+## What is this for? (EN)
+If you have a few inexpensive Xiaomi/Mijia thermometers and want to collect them into a single web view on your local network, this does exactly that. It also lets you forward the data to cloud services so you can see temperatures outside your home network.
+
+**Supported payloads / messages:** pvvx, ATC and BTHome v2 (Service Data UUID 0x181A / 0xFCD2) and Xiaomi MiBeacon (Manufacturer Data UUID 0xFE95).
+
+**Original firmware?** It can work if the device advertises MiBeacon or compatible service data, but for best results we recommend the pvvx custom firmware:
+https://pvvx.github.io/ATC_MiThermometer/TelinkMiFlasher.html
+
+Why it’s better: configurable advertising interval, richer payloads (more fields), more consistent readings, and generally better compatibility with BLE scanners.
+
+## Mihin tätä käytetään? (FI)
+Jos sinulla on muutamia edullisia Xiaomi/Mijia‑mittareita ja haluat koota ne kotiverkkoon yhteen www‑näkymään, tämä auttaa siihen. Lisäksi sovellus mahdollistaa datan lähettämisen pilvipalveluihin, jotta näet lämpötilat myös kotiverkon ulkopuolelta.
+
+**Tuetut viestit/payloadit:** pvvx, ATC ja BTHome v2 (Service Data UUID 0x181A / 0xFCD2) sekä Xiaomi MiBeacon (Manufacturer Data UUID 0xFE95).
+
+**Alkuperäinen firmware?** Se voi toimia, jos laite lähettää MiBeacon‑ tai yhteensopivaa service dataa, mutta paras käyttökokemus saadaan pvvx‑custom‑firmwarella:
+https://pvvx.github.io/ATC_MiThermometer/TelinkMiFlasher.html
+
+Miksi se on parempi: säädettävä lähetysväli, rikkaammat payloadit (enemmän kenttiä), tasaisemmat mittaukset ja yleensä parempi yhteensopivuus BLE‑skannereiden kanssa.
+
 ## System Overview (Hub + Satellites)
 - **Hub (ESP32‑S3)**: primary scanner + web UI + HTTP API + PWA
 - **Satellites (ESP32‑C3)**: extra scanners that forward BLE data to the hub

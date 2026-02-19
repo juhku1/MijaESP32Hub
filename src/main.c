@@ -41,7 +41,7 @@ static const char *AIO_TAG = "AdafruitIO";
 
 #define BOOT_BUTTON_GPIO 0
 #define BOOT_HOLD_TIME_MS 5000
-#define AIO_SEND_INTERVAL_MS (5 * 60 * 1000)  // 5 minuuttia
+#define AIO_SEND_INTERVAL_MS (5 * 60 * 1000)  // 5 minutes
 #define BLE_RATE_INTERVAL_MS 10000
 #define DISCOVERY_PORT 19798
 #define DISCOVERY_INTERVAL_MS 5000
@@ -50,35 +50,31 @@ typedef struct {
     uint8_t addr[6];
     int8_t rssi;
     uint32_t last_seen;
-    uint32_t last_sensor_seen; // Milloin viimeinen BLE-sensoridata saatiin
-    uint32_t last_adv_seen; // Milloin viimeinen BLE-adv havaittiin
-    uint32_t adv_interval_ms_last; // Viimeisin adv-väli (ms)
-    uint32_t adv_interval_ms_avg; // Keskimääräinen adv-väli (ms)
-    uint32_t adv_interval_samples; // Kuinka monta väliä laskettu
-    bool visible;  // Näkyykö laite
+    uint32_t last_sensor_seen; // When the last BLE sensor data was received
+    bool visible;  // Is the device visible
     char name[MAX_NAME_LEN];
-    char adv_name[MAX_NAME_LEN];  // Mainosnimi (BLE-advertisement)
-    bool user_named;  // Onko käyttäjä antanut oman nimen
-    bool show_mac;  // Näytetäänkö MAC-osoite
-    bool show_ip;  // Näytetäänkö satelliitti-IP
-    uint16_t field_mask;  // Bitmask: mitä kenttiä näytetään (temp, hum, bat, batMv, rssi, age)
+    char adv_name[MAX_NAME_LEN];  // Advertised name (BLE advertisement)
+    bool user_named;  // Has the user set a custom name
+    bool show_mac;  // Show MAC address
+    bool show_ip;  // Show satellite IP
+    uint16_t field_mask;  // Bitmask: which fields to show (temp, hum, bat, batMv, rssi, age)
     bool has_sensor_data;
     float temperature;
     uint8_t humidity;
     uint8_t battery_pct;
     uint16_t battery_mv;
-    char firmware_type[16];  // "pvvx", "ATC", "MiBeacon", "BTHome", tai "Unknown"
-    char source[32];  // "local" tai "satellite-192.168.68.129"
+    char firmware_type[16];  // "pvvx", "ATC", "MiBeacon", "BTHome", or "Unknown"
+    char source[32];  // "local" or "satellite-192.168.68.129"
 } ble_device_t;
 
-// Field mask bitit
+// Field mask bits
 #define FIELD_TEMP   (1 << 0)
 #define FIELD_HUM    (1 << 1)
 #define FIELD_BAT    (1 << 2)
 #define FIELD_BATMV  (1 << 3)
 #define FIELD_RSSI   (1 << 4)
 #define FIELD_AGE    (1 << 5)
-#define FIELD_ALL    0xFFFF  // Kaikki kentät oletuksena
+#define FIELD_ALL    0xFFFF  // All fields by default
 
 static ble_device_t devices[MAX_DEVICES];
 static int device_count = 0;
@@ -94,22 +90,22 @@ static bool mdns_started = false;
 static char aio_username[64] = {0};
 static char aio_key[128] = {0};
 static bool aio_enabled = false;
-static uint8_t aio_feed_types = FIELD_TEMP | FIELD_HUM;  // Oletuksena temp + hum
+static uint8_t aio_feed_types = FIELD_TEMP | FIELD_HUM;  // Default temp + hum
 static esp_timer_handle_t aio_timer = NULL;
 static esp_timer_handle_t ble_rate_timer = NULL;
 
-// BLE-pakettimäärät
+// BLE packet counters
 static uint32_t ble_adv_count = 0;
 static uint32_t ble_sensor_count = 0;
 static uint32_t sat_adv_count = 0;
 static uint32_t sat_sensor_count = 0;
 
-// Skannauksen hallinta
-// HUOM: Skannaus pyörii JATKUVASTI, mutta uusia laitteita lisätään vain discovery-moden aikana
-static bool allow_new_devices = false;  // Sallitaanko uusien laitteiden lisääminen (discovery mode)
-static bool master_ble_enabled = true;  // Onko paikallinen BLE-skannaus käytössä (vai vain satelliitit)
+// Scan control
+// NOTE: Scanning runs CONTINUOUSLY, but new devices are only added in discovery mode
+static bool allow_new_devices = false;  // Allow adding new devices (discovery mode)
+static bool master_ble_enabled = true;  // Is local BLE scanning enabled (or satellites only)
 
-// Tallenna laitteen asetukset NVS:ään
+// Save device settings to NVS
 static void save_device_settings(uint8_t *addr, const char *name, bool show_mac, bool show_ip, uint16_t field_mask, bool user_named) {
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
@@ -117,44 +113,44 @@ static void save_device_settings(uint8_t *addr, const char *name, bool show_mac,
         snprintf(base_key, sizeof(base_key), "%02X%02X%02X%02X%02X%02X",
             addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
         
-        // Tallenna nimi
+        // Save name
         if (name && strlen(name) > 0) {
             char name_key[24];
             snprintf(name_key, sizeof(name_key), "%s_n", base_key);
             nvs_set_str(nvs, name_key, name);
         }
 
-        // Tallenna user_named
+        // Save user_named
         char user_key[24];
         snprintf(user_key, sizeof(user_key), "%s_u", base_key);
         nvs_set_u8(nvs, user_key, user_named ? 1 : 0);
         
-        // Tallenna show_mac
+        // Save show_mac
         char mac_key[24];
         snprintf(mac_key, sizeof(mac_key), "%s_m", base_key);
         nvs_set_u8(nvs, mac_key, show_mac ? 1 : 0);
 
-        // Tallenna show_ip
+        // Save show_ip
         char ip_key[24];
         snprintf(ip_key, sizeof(ip_key), "%s_i", base_key);
         nvs_set_u8(nvs, ip_key, show_ip ? 1 : 0);
         
-        // Tallenna field_mask
+        // Save field_mask
         char field_key[24];
         snprintf(field_key, sizeof(field_key), "%s_f", base_key);
         nvs_set_u16(nvs, field_key, field_mask);
         
         nvs_commit(nvs);
         nvs_close(nvs);
-        ESP_LOGI(TAG, "Tallennettu asetukset: %s, name=%s, user_named=%d, show_mac=%d, show_ip=%d, fields=0x%04X", 
+        ESP_LOGI(TAG, "Saved settings: %s, name=%s, user_named=%d, show_mac=%d, show_ip=%d, fields=0x%04X", 
              base_key, name, user_named ? 1 : 0, show_mac, show_ip, field_mask);
     }
 }
 
-// Lataa laitteen asetukset NVS:stä
+// Load device settings from NVS
 static void load_device_settings(uint8_t *addr, char *name_out, bool *show_mac_out, bool *show_ip_out, uint16_t *field_mask_out, bool *user_named_out) {
     nvs_handle_t nvs;
-    // Oletusarvot
+    // Defaults
     name_out[0] = '\0';
     *show_mac_out = true;
     *show_ip_out = false;
@@ -166,24 +162,24 @@ static void load_device_settings(uint8_t *addr, char *name_out, bool *show_mac_o
         snprintf(base_key, sizeof(base_key), "%02X%02X%02X%02X%02X%02X",
             addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
         
-        // Lataa nimi
+        // Load name
         char name_key[24];
         snprintf(name_key, sizeof(name_key), "%s_n", base_key);
         size_t name_len = MAX_NAME_LEN;
         nvs_get_str(nvs, name_key, name_out, &name_len);
 
-        // Lataa user_named
+        // Load user_named
         char user_key[24];
         snprintf(user_key, sizeof(user_key), "%s_u", base_key);
         uint8_t user_named_val = 0;
         if (nvs_get_u8(nvs, user_key, &user_named_val) == ESP_OK) {
             *user_named_out = user_named_val ? true : false;
         } else if (name_out[0] != '\0') {
-            // Taaksepäin yhteensopivuus: jos nimi on tallennettu, oletetaan käyttäjän antamaksi
+            // Backward compatibility: if a name is stored, assume it's user-provided
             *user_named_out = true;
         }
         
-        // Lataa show_mac
+        // Load show_mac
         char mac_key[24];
         snprintf(mac_key, sizeof(mac_key), "%s_m", base_key);
         uint8_t show_mac_val = 1;
@@ -191,7 +187,7 @@ static void load_device_settings(uint8_t *addr, char *name_out, bool *show_mac_o
             *show_mac_out = show_mac_val ? true : false;
         }
 
-        // Lataa show_ip
+        // Load show_ip
         char ip_key[24];
         snprintf(ip_key, sizeof(ip_key), "%s_i", base_key);
         uint8_t show_ip_val = 0;
@@ -199,7 +195,7 @@ static void load_device_settings(uint8_t *addr, char *name_out, bool *show_mac_o
             *show_ip_out = show_ip_val ? true : false;
         }
         
-        // Lataa field_mask
+        // Load field_mask
         char field_key[24];
         snprintf(field_key, sizeof(field_key), "%s_f", base_key);
         nvs_get_u16(nvs, field_key, field_mask_out);
@@ -208,7 +204,7 @@ static void load_device_settings(uint8_t *addr, char *name_out, bool *show_mac_o
     }
 }
 
-// Tallenna laitteen näkyvyysasetus NVS:ään
+// Save device visibility setting to NVS
 static void save_visibility(uint8_t *addr, bool visible) {
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
@@ -216,7 +212,7 @@ static void save_visibility(uint8_t *addr, bool visible) {
         snprintf(key, sizeof(key), "%02X%02X%02X%02X%02X%02X",
             addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
         uint8_t val = visible ? 1 : 0;
-        ESP_LOGI(TAG, "NVS tallennetaan visibility: %s -> %d", key, val);
+        ESP_LOGI(TAG, "NVS save visibility: %s -> %d", key, val);
         nvs_set_u8(nvs, key, val);
         nvs_commit(nvs);
         nvs_close(nvs);
@@ -224,33 +220,33 @@ static void save_visibility(uint8_t *addr, bool visible) {
 }
 static bool load_visibility(uint8_t *addr) {
     nvs_handle_t nvs;
-    uint8_t val = 0;  // Oletuksena PIILOTETTU (ei ole vielä valittu päänäkymään)
+    uint8_t val = 0;  // Default HIDDEN (not yet selected for main view)
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
         char key[20];
         snprintf(key, sizeof(key), "%02X%02X%02X%02X%02X%02X",
             addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
         esp_err_t err = nvs_get_u8(nvs, key, &val);
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "NVS ladattu: %s -> visible=%d", key, val);
+            ESP_LOGI(TAG, "NVS loaded: %s -> visible=%d", key, val);
         } else {
-            ESP_LOGI(TAG, "NVS: %s ei löytynyt (err=%d), oletusarvo visible=0", key, err);
+            ESP_LOGI(TAG, "NVS: %s not found (err=%d), default visible=0", key, err);
         }
         nvs_close(nvs);
     }
     return val ? true : false;
 }
 
-// Lataa kaikki NVS:ään tallennetut laitteet käynnistyksessä
+// Load all devices stored in NVS at startup
 static void load_all_devices_from_nvs(void) {
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
-        ESP_LOGI(TAG, "NVS ei vielä ole käytössä tai ei laitteita");
+        ESP_LOGI(TAG, "NVS not initialized yet or no devices");
         return;
     }
     
-    ESP_LOGI(TAG, "Ladataan kaikki laitteet NVS:stä...");
+    ESP_LOGI(TAG, "Loading all devices from NVS...");
     
-    // Käy läpi kaikki NVS-avaimet
+    // Iterate over all NVS keys
     nvs_iterator_t it = NULL;
     esp_err_t res = nvs_entry_find("nvs", NVS_NAMESPACE, NVS_TYPE_ANY, &it);
     
@@ -258,7 +254,7 @@ static void load_all_devices_from_nvs(void) {
         nvs_entry_info_t info;
         nvs_entry_info(it, &info);
         
-        // Tarkistetaan onko tämä visibility-avain (12 hex-merkkiä ilman _-päätettä)
+        // Check if this is a visibility key (12 hex chars without _ suffix)
         if (strlen(info.key) == 12) {
             bool is_hex = true;
             for (int i = 0; i < 12; i++) {
@@ -270,34 +266,30 @@ static void load_all_devices_from_nvs(void) {
             }
             
             if (is_hex) {
-                // Parsitaan MAC-osoite
+                // Parse MAC address
                 uint8_t addr[6];
                 for (int i = 0; i < 6; i++) {
                     char byte_str[3] = {info.key[i*2], info.key[i*2+1], 0};
                     addr[5-i] = (uint8_t)strtol(byte_str, NULL, 16);
                 }
                 
-                // Lisää laite listaan
+                // Add device to list
                 memcpy(devices[device_count].addr, addr, 6);
                 devices[device_count].visible = load_visibility(addr);
                 devices[device_count].rssi = 0;
                 devices[device_count].last_seen = 0;
                 devices[device_count].last_sensor_seen = 0;
-                devices[device_count].last_adv_seen = 0;
-                devices[device_count].adv_interval_ms_last = 0;
-                devices[device_count].adv_interval_ms_avg = 0;
-                devices[device_count].adv_interval_samples = 0;
                 devices[device_count].has_sensor_data = false;
                 devices[device_count].adv_name[0] = '\0';
                 
-                // Lataa muut asetukset
+                // Load other settings
                 load_device_settings(addr, devices[device_count].name,
                             &devices[device_count].show_mac,
                             &devices[device_count].show_ip,
                             &devices[device_count].field_mask,
                             &devices[device_count].user_named);
                 
-                ESP_LOGI(TAG, "  Ladattu laite %d: %02X:%02X:%02X:%02X:%02X:%02X, name=%s",
+                ESP_LOGI(TAG, "  Loaded device %d: %02X:%02X:%02X:%02X:%02X:%02X, name=%s",
                         device_count,
                         addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
                         devices[device_count].name);
@@ -312,49 +304,45 @@ static void load_all_devices_from_nvs(void) {
     nvs_release_iterator(it);
     nvs_close(nvs);
     
-    ESP_LOGI(TAG, "Ladattu yhteensä %d laitetta NVS:stä", device_count);
+    ESP_LOGI(TAG, "Loaded %d devices from NVS", device_count);
 }
 
 
 static int find_or_add_device(uint8_t *addr, bool allow_adding_new) {
-    // Etsi onko laite jo listassa
+    // Check if the device is already in the list
     for (int i = 0; i < device_count; i++) {
         if (memcmp(devices[i].addr, addr, 6) == 0) {
             return i;
         }
     }
     
-    // Lisää uusi laite vain jos sallittu (discovery mode päällä)
+    // Add a new device only if allowed (discovery mode on)
     if (!allow_adding_new) {
-        return -1;  // Ei lisätä uusia laitteita monitoring-moden aikana
+        return -1;  // Do not add new devices in monitoring mode
     }
     
-    // Lisää uusi laite - oletuksena PIILOTETTU (näkyy vain discovery-popupissa)
+    // Add a new device - default HIDDEN (shown only in discovery popup)
     if (device_count < MAX_DEVICES) {
         memcpy(devices[device_count].addr, addr, 6);
-        devices[device_count].visible = false;  // Piilotettu kunnes käyttäjä lisää päänäkymään
+        devices[device_count].visible = false;  // Hidden until user adds to main view
         devices[device_count].rssi = 0;
         devices[device_count].last_seen = 0;
         devices[device_count].last_sensor_seen = 0;
-        devices[device_count].last_adv_seen = 0;
-        devices[device_count].adv_interval_ms_last = 0;
-        devices[device_count].adv_interval_ms_avg = 0;
-        devices[device_count].adv_interval_samples = 0;
         devices[device_count].has_sensor_data = false;
         devices[device_count].adv_name[0] = '\0';
-        strcpy(devices[device_count].source, "local");  // Paikallinen laite
+        strcpy(devices[device_count].source, "local");  // Local device
         
-        // Lataa tallennetut asetukset (nimi, show_mac, field_mask)
+        // Load stored settings (name, show_mac, field_mask)
         load_device_settings(addr, devices[device_count].name, 
                &devices[device_count].show_mac,
                &devices[device_count].show_ip,
                &devices[device_count].field_mask,
                &devices[device_count].user_named);
         
-        // Lataa visibility NVS:stä (jos tallennettu)
+        // Load visibility from NVS (if stored)
         devices[device_count].visible = load_visibility(addr);
         
-        ESP_LOGI(TAG, "Uusi laite löydetty: %02X:%02X:%02X:%02X:%02X:%02X, name=%s, visible=%d",
+        ESP_LOGI(TAG, "New device found: %02X:%02X:%02X:%02X:%02X:%02X, name=%s, visible=%d",
                  addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
                  devices[device_count].name, devices[device_count].visible);
         return device_count++;
@@ -364,80 +352,66 @@ static int find_or_add_device(uint8_t *addr, bool allow_adding_new) {
 
 static int ble_gap_event(struct ble_gap_event *event, void *arg) {
     if (event->type == BLE_GAP_EVENT_DISC) {
-        // Tarkista onko master BLE käytössä
+        // Check if master BLE is enabled
         if (!master_ble_enabled) {
-            return 0;  // Ohitetaan paikalliset BLE-havainnot
+            return 0;  // Skip local BLE observations
         }
         
         ble_adv_count++;
-        // Discovery mode: lisää uusia + päivitä kaikkia
-        // Monitoring mode: päivitä vain visible=true laitteita
+        // Discovery mode: add new + update all
+        // Monitoring mode: update only visible=true devices
         int idx = find_or_add_device(event->disc.addr.val, allow_new_devices);
         
-        // LOG: Paikallinen BLE-havainto
+        // LOG: Local BLE observation
         ESP_LOGI(TAG, "📡 LOCAL BLE: %02X:%02X:%02X:%02X:%02X:%02X, RSSI: %d dBm, data_len: %d",
                  event->disc.addr.val[5], event->disc.addr.val[4], event->disc.addr.val[3],
                  event->disc.addr.val[2], event->disc.addr.val[1], event->disc.addr.val[0],
                  event->disc.rssi, event->disc.length_data);
         
-        // Jos laite ei ole listassa, ohita (uusia ei lisätä monitoring-modessa)
+        // If the device is not in the list, skip (new devices aren't added in monitoring mode)
         if (idx < 0) {
             return 0;
         }
         
         if (idx >= 0) {
-            // Päivitä RSSI ja aikaleima aina
+            // Always update RSSI and timestamp
             devices[idx].rssi = event->disc.rssi;
             uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
             devices[idx].last_seen = now_ms;
             
-            // Lähde = paikallinen aina kun paikallinen havainto tulee
+            // Source = local whenever a local observation arrives
             strcpy(devices[idx].source, "local");
-            if (devices[idx].last_adv_seen > 0 && now_ms >= devices[idx].last_adv_seen) {
-                uint32_t delta = now_ms - devices[idx].last_adv_seen;
-                devices[idx].adv_interval_ms_last = delta;
-                if (devices[idx].adv_interval_samples == 0) {
-                    devices[idx].adv_interval_ms_avg = delta;
-                } else {
-                    uint64_t sum = (uint64_t)devices[idx].adv_interval_ms_avg * devices[idx].adv_interval_samples + delta;
-                    devices[idx].adv_interval_ms_avg = (uint32_t)(sum / (devices[idx].adv_interval_samples + 1));
-                }
-                if (devices[idx].adv_interval_samples < UINT32_MAX) {
-                    devices[idx].adv_interval_samples++;
-                }
-            }
-            devices[idx].last_adv_seen = now_ms;
             
-            // Jos laite on piilotettu ja discovery-mode pois, ei päivitetä mainosnimeä/sensoridataa
+            // If the device is hidden and discovery mode is off, don't update adv name/sensor data
             if (!allow_new_devices && !devices[idx].visible) {
                 return 0;
             }
 
-            // Parsitaan mainosdata
+            // Parse advertisement data
             struct ble_hs_adv_fields fields;
             if (ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data) == 0) {
                 
-                // Mainosnimi (adv_name) päivittyy vain jos käyttäjä ei ole antanut omaa nimeä
+                // adv_name updates only if the user hasn't set a custom name
                 if (!devices[idx].user_named && fields.name != NULL && fields.name_len > 0) {
                     int copy_len = (fields.name_len < MAX_NAME_LEN - 1) ? fields.name_len : MAX_NAME_LEN - 1;
                     memcpy(devices[idx].adv_name, fields.name, copy_len);
                     devices[idx].adv_name[copy_len] = '\0';
-                    // Päivitä name vain jos tyhjä (käyttäjä ei ole asettanut omaa)
+                    // Update name only if empty (user hasn't set a custom one)
                     if (devices[idx].name[0] == '\0') {
                         memcpy(devices[idx].name, fields.name, copy_len);
                         devices[idx].name[copy_len] = '\0';
-                        ESP_LOGI(TAG, "BLE-nimi kopioitu: %s", devices[idx].name);
+                        ESP_LOGI(TAG, "BLE name copied: %s", devices[idx].name);
                     }
                 } else if (devices[idx].name[0] == '\0') {
-                    ESP_LOGI(TAG, "BLE-advertsissä ei nimeä tälle laitteelle");
+                    ESP_LOGI(TAG, "No BLE name in advertisement for this device");
                 }
                 
-                // Sensoridata (pvvx/ATC-muoto UUID 0x181A tai MiBeacon UUID 0xFE95 tai BTHome v2 UUID 0xFCD2)
+                // Sensor data (pvvx/ATC UUID 0x181A or MiBeacon UUID 0xFE95 or BTHome v2 UUID 0xFCD2)
                 if (fields.svc_data_uuid16 != NULL && fields.svc_data_uuid16_len >= 13) {
                     uint16_t uuid = fields.svc_data_uuid16[0] | (fields.svc_data_uuid16[1] << 8);
                     
                     if (uuid == 0x181A) {
-                        // pvvx tai ATC custom firmware
+                        // pvvx or ATC custom firmware
                         ble_sensor_data_t sensor_data;
                         bool parsed = false;
                         
@@ -459,7 +433,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                             devices[idx].last_sensor_seen = now_ms;
                         }
                     } else if (uuid == 0xFE95) {
-                        // MiBeacon - Xiaomi alkuperäinen firmware
+                        // MiBeacon - Xiaomi original firmware
                         ble_sensor_data_t sensor_data;
                         bool parsed = ble_parse_mibeacon_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
                         
@@ -475,7 +449,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                             devices[idx].last_sensor_seen = now_ms;
                         }
                     } else if (uuid == 0xFCD2) {
-                        // BTHome v2 - Yleinen standardi (pvvx tukee tätä)
+                        // BTHome v2 - common standard (pvvx supports this)
                         ble_sensor_data_t sensor_data;
                         bool parsed = ble_parse_bthome_v2_format(fields.svc_data_uuid16, fields.svc_data_uuid16_len, &sensor_data);
                         
@@ -525,30 +499,30 @@ static void ble_rate_timer_callback(void* arg) {
              d_sat_adv / interval_s, d_sat_sensor / interval_s);
 }
 
-// BLE-stack valmis, käynnistetään jatkuva skannaus
+// BLE stack ready, start continuous scan
 static void ble_app_on_sync(void) {
-    ESP_LOGI(TAG, "BLE-stack synkronoitu ja valmis");
-    ESP_LOGI(TAG, "Käynnistetään JATKUVA skannaus olemassa olevien laitteiden seurantaan");
+    ESP_LOGI(TAG, "BLE stack synchronized and ready");
+    ESP_LOGI(TAG, "Starting CONTINUOUS scan to track existing devices");
     
-    // Käynnistä jatkuva skannaus (WiFi-yhteensopivilla parametreilla)
+    // Start continuous scan (WiFi-friendly parameters)
     struct ble_gap_disc_params disc_params = {0};
     disc_params.itvl = 0x50;    // 80 * 0.625ms = 50ms interval
     disc_params.window = 0x30;  // 48 * 0.625ms = 30ms window (60% duty cycle)
-    disc_params.passive = 0;  // Active scan jotta saadaan scan response (nimi)
+    disc_params.passive = 0;  // Active scan to get scan response (name)
     
     uint8_t addr_type;
     int rc = ble_hs_id_infer_auto(0, &addr_type);
     if (rc != 0) {
-        ESP_LOGE(TAG, "BLE addr_type infer epäonnistui: %d", rc);
+        ESP_LOGE(TAG, "BLE addr_type infer failed: %d", rc);
         return;
     }
 
     rc = ble_gap_disc(addr_type, BLE_HS_FOREVER, &disc_params, ble_gap_event, NULL);
     
     if (rc != 0) {
-        ESP_LOGE(TAG, "Jatkuvan skannauksen käynnistys epäonnistui: %d", rc);
+        ESP_LOGE(TAG, "Failed to start continuous scan: %d", rc);
     } else {
-        ESP_LOGI(TAG, "✓ Jatkuva skannaus käynnissä (uusia laitteita EI lisätä ennen /api/scan kutsua)");
+        ESP_LOGI(TAG, "✓ Continuous scan running (new devices NOT added until /api/scan call)");
     }
 }
 
@@ -558,19 +532,19 @@ static void host_task(void *param) {
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(WIFI_TAG, "WiFi käynnistetty, yhdistetään...");
+        ESP_LOGI(WIFI_TAG, "WiFi started, connecting...");
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGI(WIFI_TAG, "WiFi katkesi, yhdistetään uudelleen...");
+        ESP_LOGI(WIFI_TAG, "WiFi disconnected, reconnecting...");
         wifi_connected = false;
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         wifi_connected = true;
         snprintf(master_ip, sizeof(master_ip), IPSTR, IP2STR(&event->ip_info.ip));
-        ESP_LOGI(WIFI_TAG, "✓ Yhdistetty! IP-osoite: " IPSTR, IP2STR(&event->ip_info.ip));
-        ESP_LOGI(WIFI_TAG, "Avaa selaimessa: http://" IPSTR, IP2STR(&event->ip_info.ip));
-        ESP_LOGI(WIFI_TAG, "Discovery-broadcast valmis (portti %d, 5 s välein)", DISCOVERY_PORT);
+        ESP_LOGI(WIFI_TAG, "✓ Connected! IP address: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(WIFI_TAG, "Open in browser: http://" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(WIFI_TAG, "Discovery broadcast ready (port %d, every 5 s)", DISCOVERY_PORT);
 #if HAVE_MDNS
         ESP_LOGI(WIFI_TAG, "mDNS available (HAVE_MDNS=1)");
         if (!mdns_started) {
@@ -584,10 +558,10 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
                 };
                 mdns_service_add("BLE Master", "_http", "_tcp", 80, txt_data, 2);
                 mdns_started = true;
-                ESP_LOGI(WIFI_TAG, "✅ mDNS käynnistetty: http://%s.local", MDNS_HOSTNAME);
+                ESP_LOGI(WIFI_TAG, "✅ mDNS started: http://%s.local", MDNS_HOSTNAME);
                 ESP_LOGI(WIFI_TAG, "mDNS service: _http._tcp port 80, txt(role=master, path=/api/satellite-data)");
             } else {
-                ESP_LOGW(WIFI_TAG, "❌ mDNS init epäonnistui: %s", esp_err_to_name(err));
+                ESP_LOGW(WIFI_TAG, "❌ mDNS init failed: %s", esp_err_to_name(err));
             }
         }
 #else
@@ -635,7 +609,7 @@ static void discovery_broadcast_task(void *param) {
 static bool load_wifi_config(void) {
     nvs_handle_t nvs;
     if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
-        ESP_LOGW(WIFI_TAG, "WiFi-asetuksia ei löydy NVS:stä");
+        ESP_LOGW(WIFI_TAG, "WiFi settings not found in NVS");
         return false;
     }
     
@@ -658,7 +632,7 @@ static bool load_wifi_config(void) {
 static void save_wifi_config(const char* ssid, const char* password) {
     nvs_handle_t nvs;
     if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
-        ESP_LOGE(WIFI_TAG, "NVS:n avaus epäonnistui");
+        ESP_LOGE(WIFI_TAG, "Failed to open NVS");
         return;
     }
     
@@ -713,7 +687,7 @@ static void check_boot_button(void) {
 static bool load_aio_config(void) {
     nvs_handle_t nvs;
     if (nvs_open(NVS_AIO_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
-        ESP_LOGW(AIO_TAG, "Adafruit IO -asetuksia ei löydy");
+        ESP_LOGW(AIO_TAG, "Adafruit IO settings not found");
         return false;
     }
     
@@ -741,7 +715,7 @@ static bool load_aio_config(void) {
 static void save_aio_config(const char* username, const char* key, bool enabled, uint8_t feed_types) {
     nvs_handle_t nvs;
     if (nvs_open(NVS_AIO_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
-        ESP_LOGE(AIO_TAG, "NVS:n avaus epäonnistui");
+        ESP_LOGE(AIO_TAG, "Failed to open NVS");
         return;
     }
     
@@ -757,7 +731,7 @@ static void save_aio_config(const char* username, const char* key, bool enabled,
     aio_enabled = enabled;
     aio_feed_types = feed_types;
     
-    ESP_LOGI(AIO_TAG, "Asetukset tallennettu, types=0x%02x", feed_types);
+    ESP_LOGI(AIO_TAG, "Settings saved, types=0x%02x", feed_types);
 }
 
 static void wifi_init(void) {
@@ -772,10 +746,10 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
     
-    // Tarkista onko WiFi määritetty
+    // Check if WiFi is configured
     if (!load_wifi_config()) {
-        // EI WiFi-asetuksia -> AP-tila
-        ESP_LOGI(WIFI_TAG, "🔧 Setup-tila: Käynnistetään AP-tila");
+        // No WiFi settings -> AP mode
+        ESP_LOGI(WIFI_TAG, "🔧 Setup mode: starting AP mode");
         setup_mode = true;
         
         esp_netif_create_default_wifi_ap();
@@ -795,22 +769,22 @@ static void wifi_init(void) {
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
         ESP_ERROR_CHECK(esp_wifi_start());
         
-        ESP_LOGI(WIFI_TAG, "✓ AP käynnistetty: BLE-Monitor-Setup");
-        ESP_LOGI(WIFI_TAG, "Avaa selaimessa: http://192.168.4.1");
+        ESP_LOGI(WIFI_TAG, "✓ AP started: BLE-Monitor-Setup");
+        ESP_LOGI(WIFI_TAG, "Open in browser: http://192.168.4.1");
     } else {
-        // WiFi määritetty -> STA+AP -tila (molemmat päällä)
-        ESP_LOGI(WIFI_TAG, "Yhdistetään verkkoon: %s", wifi_ssid);
+        // WiFi configured -> STA+AP mode (both enabled)
+        ESP_LOGI(WIFI_TAG, "Connecting to network: %s", wifi_ssid);
         setup_mode = false;
         
         esp_netif_create_default_wifi_sta();
         esp_netif_create_default_wifi_ap();
         
-        // STA-konfiguraatio
+        // STA configuration
         wifi_config_t sta_config = {0};
         strncpy((char*)sta_config.sta.ssid, wifi_ssid, sizeof(sta_config.sta.ssid));
         strncpy((char*)sta_config.sta.password, wifi_password, sizeof(sta_config.sta.password));
         
-        // AP-konfiguraatio (vara-access point)
+        // AP configuration (fallback access point)
         wifi_config_t ap_config = {
             .ap = {
                 .ssid = "BLE-Monitor",
@@ -827,7 +801,7 @@ static void wifi_init(void) {
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
         ESP_ERROR_CHECK(esp_wifi_start());
         
-        ESP_LOGI(WIFI_TAG, "✓ AP käynnistetty: BLE-Monitor (vara-access point)");
+        ESP_LOGI(WIFI_TAG, "✓ AP started: BLE-Monitor (fallback access point)");
         ESP_LOGI(WIFI_TAG, "Vara-AP: http://192.168.4.1");
     }
 }
@@ -842,14 +816,14 @@ static void send_device_to_aio(const ble_device_t *dev) {
     char url[256];
     char payload[256];
     
-    // Feed key: käytä nimeä jos on, muuten MAC
+    // Feed key: use name if present, otherwise MAC
     char feed_key[64];
     char mac_str[20];
     snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
              dev->addr[0], dev->addr[1], dev->addr[2], dev->addr[3], dev->addr[4], dev->addr[5]);
     
     if (strlen(dev->name) > 0) {
-        // Muunna nimi feed keyksi: lowercase, välilyönnit → viivat
+        // Convert name to feed key: lowercase, spaces -> dashes
         char safe_name[MAX_NAME_LEN];
         int j = 0;
         char prev = '\0';
@@ -862,7 +836,7 @@ static void send_device_to_aio(const ble_device_t *dev) {
                 safe_name[j++] = c + 32;  // Lowercase
                 prev = c + 32;
             } else if (c == ' ' || c == '_' || c == '-') {
-                // Lisää viiva vain jos edellinen ei ollut viiva
+                // Add dash only if previous wasn't a dash
                 if (prev != '-' && j > 0) {
                     safe_name[j++] = '-';
                     prev = '-';
@@ -870,18 +844,18 @@ static void send_device_to_aio(const ble_device_t *dev) {
             }
         }
         safe_name[j] = '\0';
-        snprintf(feed_key, sizeof(feed_key), "%s-%s", safe_name, mac_str + 8);  // nimi + 4 viimeistä MAC:ia
+        snprintf(feed_key, sizeof(feed_key), "%s-%s", safe_name, mac_str + 8);  // name + last 4 of MAC
     } else {
         snprintf(feed_key, sizeof(feed_key), "%s", mac_str);
     }
     
-    // Lähetä lämpötila
-    if ((dev->field_mask & FIELD_TEMP) && (aio_feed_types & FIELD_TEMP)) {
+    // Send temperature
+        if ((dev->field_mask & FIELD_TEMP) && (aio_feed_types & FIELD_TEMP)) {
         char feed_name[80];
         snprintf(feed_name, sizeof(feed_name), "%s-temp", feed_key);
         snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds/%s/data", aio_username, feed_name);
         
-        // Lisää metadata: laitteen nimi ja MAC
+        // Add metadata: device name and MAC
         if (strlen(dev->name) > 0) {
             snprintf(payload, sizeof(payload), "{\"value\":\"%.2f\",\"feed_key\":\"%s\",\"metadata\":\"%s (%02X:%02X:%02X:%02X:%02X:%02X)\"}",
                      dev->temperature, feed_name, dev->name,
@@ -906,15 +880,15 @@ static void send_device_to_aio(const ble_device_t *dev) {
         esp_err_t err = esp_http_client_perform(client);
         int status = esp_http_client_get_status_code(client);
         if (err == ESP_OK && status == 200) {
-            ESP_LOGI(AIO_TAG, "Temp lähetetty: %s = %.2f", feed_key, dev->temperature);
+            ESP_LOGI(AIO_TAG, "Temp sent: %s = %.2f", feed_key, dev->temperature);
         } else {
-            ESP_LOGE(AIO_TAG, "Temp epäonnistui: %s, HTTP %d", esp_err_to_name(err), status);
+            ESP_LOGE(AIO_TAG, "Temp failed: %s, HTTP %d", esp_err_to_name(err), status);
         }
         esp_http_client_cleanup(client);
-        vTaskDelay(pdMS_TO_TICKS(100)); // Pieni viive requestien välillä
+        vTaskDelay(pdMS_TO_TICKS(100)); // Small delay between requests
     }
     
-    // Lähetä kosteus
+    // Send humidity
     if ((dev->field_mask & FIELD_HUM) && (aio_feed_types & FIELD_HUM)) {
         snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds/%s-hum/data", aio_username, feed_key);
         
@@ -942,15 +916,15 @@ static void send_device_to_aio(const ble_device_t *dev) {
         esp_err_t err = esp_http_client_perform(client);
         int status = esp_http_client_get_status_code(client);
         if (err == ESP_OK && status == 200) {
-            ESP_LOGI(AIO_TAG, "Hum lähetetty: %s = %d", feed_key, dev->humidity);
+            ESP_LOGI(AIO_TAG, "Hum sent: %s = %d", feed_key, dev->humidity);
         } else {
-            ESP_LOGE(AIO_TAG, "Hum epäonnistui: %s, HTTP %d", esp_err_to_name(err), status);
+            ESP_LOGE(AIO_TAG, "Hum failed: %s, HTTP %d", esp_err_to_name(err), status);
         }
         esp_http_client_cleanup(client);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     
-    // Lähetä akun taso
+    // Send battery level
     if ((dev->field_mask & FIELD_BAT) && (aio_feed_types & FIELD_BAT)) {
         snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds/%s-bat/data", aio_username, feed_key);
         
@@ -977,7 +951,7 @@ static void send_device_to_aio(const ble_device_t *dev) {
         
         esp_err_t err = esp_http_client_perform(client);
         if (err == ESP_OK) {
-            ESP_LOGI(AIO_TAG, "Bat lähetetty: %s = %d", feed_key, dev->battery_pct);
+            ESP_LOGI(AIO_TAG, "Bat sent: %s = %d", feed_key, dev->battery_pct);
         }
         esp_http_client_cleanup(client);
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -985,7 +959,7 @@ static void send_device_to_aio(const ble_device_t *dev) {
 }
 
 static void aio_upload_task(void *arg) {
-    ESP_LOGI(AIO_TAG, "Aloitetaan datan lähetys Adafruit IO:lle...");
+    ESP_LOGI(AIO_TAG, "Starting data upload to Adafruit IO...");
     
     int sent_count = 0;
     for (int i = 0; i < device_count; i++) {
@@ -995,40 +969,26 @@ static void aio_upload_task(void *arg) {
         }
     }
     
-    ESP_LOGI(AIO_TAG, "Lähetettiin %d laitetta", sent_count);
+    ESP_LOGI(AIO_TAG, "Sent %d devices", sent_count);
     vTaskDelete(NULL);
 }
 
 static void aio_timer_callback(void* arg) {
     if (!aio_enabled) return;
     
-    // Luo taski joka lähettää datan (ei blokoi timeria)
+    // Create a task that sends data (doesn't block the timer)
     xTaskCreate(aio_upload_task, "aio_upload", 8192, NULL, 5, NULL);
 }
 
-// API: Luo feedit automaattisesti
-static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
-    httpd_resp_set_type(req, "application/json");
-    
-    if (strlen(aio_username) == 0 || strlen(aio_key) == 0) {
-        const char* resp = "{\"ok\":false,\"error\":\"Adafruit IO ei määritetty\"}";
-        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-    
-    char *response = malloc(4096);
-    if (!response) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    
-    strcpy(response, "{\"ok\":true,\"feeds\":[");
+// API: Create feeds automatically
+// Background task for creating feeds
+static void create_feeds_task(void *pvParameters) {
     int created = 0;
     
     for (int i = 0; i < device_count; i++) {
         if (!devices[i].visible || !devices[i].has_sensor_data) continue;
         
-        // Generoi feed key
+        // Generate feed key
         char feed_key[64];
         char mac_str[20];
         snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
@@ -1060,7 +1020,7 @@ static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
             snprintf(feed_key, sizeof(feed_key), "%s", mac_str);
         }
         
-        // Luo temp feed
+        // Create temp feed
         if ((devices[i].field_mask & FIELD_TEMP) && (aio_feed_types & FIELD_TEMP)) {
             char url[256];
             char payload[256];
@@ -1072,6 +1032,7 @@ static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
                 .url = url,
                 .method = HTTP_METHOD_POST,
                 .crt_bundle_attach = esp_crt_bundle_attach,
+                .timeout_ms = 10000,
             };
             esp_http_client_handle_t client = esp_http_client_init(&config);
             esp_http_client_set_header(client, "Content-Type", "application/json");
@@ -1084,15 +1045,12 @@ static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
             
             if (err == ESP_OK && (status == 200 || status == 201)) {
                 created++;
-                if (created > 1) strcat(response, ",");
-                char item[128];
-                snprintf(item, sizeof(item), "\"%s-temp\"", feed_key);
-                strcat(response, item);
+                ESP_LOGI(AIO_TAG, "Created feed: %s-temp", feed_key);
             }
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(300));
         }
         
-        // Luo hum feed
+        // Create hum feed
         if ((devices[i].field_mask & FIELD_HUM) && (aio_feed_types & FIELD_HUM)) {
             char url[256];
             char payload[256];
@@ -1104,6 +1062,7 @@ static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
                 .url = url,
                 .method = HTTP_METHOD_POST,
                 .crt_bundle_attach = esp_crt_bundle_attach,
+                .timeout_ms = 10000,
             };
             esp_http_client_handle_t client = esp_http_client_init(&config);
             esp_http_client_set_header(client, "Content-Type", "application/json");
@@ -1116,35 +1075,74 @@ static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
             
             if (err == ESP_OK && (status == 200 || status == 201)) {
                 created++;
-                if (created > 1) strcat(response, ",");
-                char item[128];
-                snprintf(item, sizeof(item), "\"%s-hum\"", feed_key);
-                strcat(response, item);
+                ESP_LOGI(AIO_TAG, "Created feed: %s-hum", feed_key);
             }
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(300));
+        }
+        
+        // Create bat feed
+        if ((devices[i].field_mask & FIELD_BAT) && (aio_feed_types & FIELD_BAT)) {
+            char url[256];
+            char payload[256];
+            snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds", aio_username);
+            snprintf(payload, sizeof(payload), "{\"key\":\"%s-bat\",\"name\":\"%s Battery\"}", 
+                     feed_key, devices[i].name[0] ? devices[i].name : "Device");
+            
+            esp_http_client_config_t config = {
+                .url = url,
+                .method = HTTP_METHOD_POST,
+                .crt_bundle_attach = esp_crt_bundle_attach,
+                .timeout_ms = 10000,
+            };
+            esp_http_client_handle_t client = esp_http_client_init(&config);
+            esp_http_client_set_header(client, "Content-Type", "application/json");
+            esp_http_client_set_header(client, "X-AIO-Key", aio_key);
+            esp_http_client_set_post_field(client, payload, strlen(payload));
+            
+            esp_err_t err = esp_http_client_perform(client);
+            int status = esp_http_client_get_status_code(client);
+            esp_http_client_cleanup(client);
+            
+            if (err == ESP_OK && (status == 200 || status == 201)) {
+                created++;
+                ESP_LOGI(AIO_TAG, "Created feed: %s-bat", feed_key);
+            }
+            vTaskDelay(pdMS_TO_TICKS(300));
         }
     }
     
-    char end[64];
-    snprintf(end, sizeof(end), "],\"count\":%d}", created);
-    strcat(response, end);
-    
-    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
-    free(response);
-    return ESP_OK;
+    ESP_LOGI(AIO_TAG, "Feed creation completed: %d feeds created", created);
+    vTaskDelete(NULL);
 }
 
-// API: Poista feedit tyypin mukaan (temp/hum/bat)
-static esp_err_t api_aio_delete_feeds_handler(httpd_req_t *req) {
+static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     
     if (strlen(aio_username) == 0 || strlen(aio_key) == 0) {
-        const char* resp = "{\"ok\":false,\"error\":\"Adafruit IO ei määritetty\"}";
+        const char* resp = "{\"ok\":false,\"error\":\"Adafruit IO not configured\"}";
         httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
     
-    // Hae types parametri query stringistä
+    // Start background task for feed creation
+    xTaskCreate(create_feeds_task, "create_feeds", 8192, NULL, 5, NULL);
+    
+    const char* resp = "{\"ok\":true,\"message\":\"Creating feeds in background, check logs\"}";
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// API: Delete feeds by type (temp/hum/bat)
+static esp_err_t api_aio_delete_feeds_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    
+    if (strlen(aio_username) == 0 || strlen(aio_key) == 0) {
+        const char* resp = "{\"ok\":false,\"error\":\"Adafruit IO not configured\"}";
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    // Get types parameter from query string
     char query[64];
     uint8_t types_to_delete = 0;
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
@@ -1155,7 +1153,7 @@ static esp_err_t api_aio_delete_feeds_handler(httpd_req_t *req) {
     }
     
     if (types_to_delete == 0) {
-        const char* resp = "{\"ok\":false,\"error\":\"Ei poistettavia tyyppejä\"}";
+        const char* resp = "{\"ok\":false,\"error\":\"No types to delete\"}";
         httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
@@ -1164,15 +1162,15 @@ static esp_err_t api_aio_delete_feeds_handler(httpd_req_t *req) {
     const char* suffixes[3] = {"-temp", "-hum", "-bat"};
     uint8_t type_bits[3] = {FIELD_TEMP, FIELD_HUM, FIELD_BAT};
     
-    // Käy läpi jokainen tyyppi joka pitää poistaa
+    // Iterate over each type to delete
     for (int t = 0; t < 3; t++) {
         if (!(types_to_delete & type_bits[t])) continue;
         
-        // Käy läpi kaikki näkyvät laitteet
+        // Iterate over all visible devices
         for (int i = 0; i < device_count; i++) {
             if (!devices[i].visible) continue;
             
-            // Generoi feed key
+            // Generate feed key
             char feed_key[64];
             char mac_str[20];
             snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
@@ -1204,7 +1202,7 @@ static esp_err_t api_aio_delete_feeds_handler(httpd_req_t *req) {
                 snprintf(feed_key, sizeof(feed_key), "%s%s", mac_str, suffixes[t]);
             }
             
-            // Poista feed
+            // Delete feed
             char url[256];
             snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds/%s", aio_username, feed_key);
             
@@ -1222,7 +1220,7 @@ static esp_err_t api_aio_delete_feeds_handler(httpd_req_t *req) {
             
             if (err == ESP_OK && (status == 200 || status == 204)) {
                 deleted++;
-                ESP_LOGI(AIO_TAG, "Feed poistettu: %s", feed_key);
+                ESP_LOGI(AIO_TAG, "Feed deleted: %s", feed_key);
             }
             vTaskDelay(pdMS_TO_TICKS(150));
         }
@@ -1234,26 +1232,26 @@ static esp_err_t api_aio_delete_feeds_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// API: Lähetä data nyt (testaus)
+// API: Send data now (test)
 static esp_err_t api_aio_send_now_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     
     if (!aio_enabled || strlen(aio_username) == 0 || strlen(aio_key) == 0) {
-        const char* resp = "{\"ok\":false,\"error\":\"Adafruit IO ei käytössä\"}";
+        const char* resp = "{\"ok\":false,\"error\":\"Adafruit IO not enabled\"}";
         httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
     
-    // Luo taski joka lähettää datan
+    // Create a task that sends data
     xTaskCreate(aio_upload_task, "aio_upload", 8192, NULL, 5, NULL);
     
-    const char* resp = "{\"ok\":true,\"message\":\"Lähetys aloitettu\"}";
+    const char* resp = "{\"ok\":true,\"message\":\"Send started\"}";
     httpd_resp_sendstr(req, resp);
     return ESP_OK;
 }
 
 // ============================================
-// WEB-KÄYTTÖLIITTYMÄ
+// WEB UI
 // ============================================
 
 static esp_err_t root_get_handler(httpd_req_t *req) {
@@ -1308,14 +1306,14 @@ static esp_err_t api_setup_handler(httpd_req_t *req) {
             strncpy(password, pass_start, pass_len);
         }
         
-        // Tallenna ja käynnistä uudelleen
+        // Save and restart
         save_wifi_config(ssid, password);
         
         const char* resp = "{\"ok\":true}";
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
         
-        ESP_LOGI(WIFI_TAG, "WiFi määritelty, käynnistetään uudelleen...");
+        ESP_LOGI(WIFI_TAG, "WiFi configured, restarting...");
         vTaskDelay(pdMS_TO_TICKS(1000));
         esp_restart();
         
@@ -1328,7 +1326,7 @@ static esp_err_t api_setup_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// API: Adafruit IO asetukset
+// API: Adafruit IO settings
 static esp_err_t api_aio_config_handler(httpd_req_t *req) {
     char buf[512];
     int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
@@ -1400,7 +1398,7 @@ static esp_err_t api_aio_config_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// API: Hae Adafruit IO asetukset
+// API: Get Adafruit IO settings
 static esp_err_t api_aio_get_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     
@@ -1417,52 +1415,52 @@ static esp_err_t api_aio_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// API: Käynnistä discovery mode (uusien laitteiden etsintä) 30 sekunniksi
-// HUOM: Skannaus pyörii jo jatkuvasti, tämä vain sallii uusien laitteiden lisäämisen
+// API: Start discovery mode (search for new devices)
+// NOTE: Scanning runs continuously; this only allows adding new devices
 static esp_err_t api_start_scan_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_type(req, "application/json");
     
     if (allow_new_devices) {
-        ESP_LOGW(TAG, "Discovery mode on jo käynnissä");
+        ESP_LOGW(TAG, "Discovery mode is already running");
         httpd_resp_sendstr(req, "{\"ok\":true,\"already_running\":true}");
         return ESP_OK;
     }
     
-    ESP_LOGI(TAG, "🔍 DISCOVERY MODE käynnistetty (ei ajastinta, pysyy päällä kunnes suljetaan)");
+    ESP_LOGI(TAG, "🔍 DISCOVERY MODE started (no timer, stays on until stopped)");
     
-    // Salli uusien laitteiden lisääminen
+    // Allow adding new devices
     allow_new_devices = true;
     
     httpd_resp_sendstr(req, "{\"ok\":true,\"already_running\":false}");
     return ESP_OK;
 }
 
-// API: Lopeta discovery-mode (uusien laitteiden etsintä)
+// API: Stop discovery mode (search for new devices)
 static esp_err_t api_stop_scan_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_type(req, "application/json");
     
-    ESP_LOGI(TAG, "🔍 DISCOVERY MODE lopetettu");
+    ESP_LOGI(TAG, "🔍 DISCOVERY MODE stopped");
     allow_new_devices = false;
     
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
 }
 
-// API: Hae tai tallenna skannausasetukset (GET tai POST)
+// API: Get or save scan settings (GET or POST)
 static esp_err_t api_scan_settings_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_type(req, "application/json");
     
     if (req->method == HTTP_GET) {
-        // Palauta nykyiset asetukset
+        // Return current settings
         char response[128];
         snprintf(response, sizeof(response), "{\"ok\":true,\"masterBleEnabled\":%s}", 
                  master_ble_enabled ? "true" : "false");
         httpd_resp_sendstr(req, response);
     } else if (req->method == HTTP_POST) {
-        // Tallenna uudet asetukset
+        // Save new settings
         char buf[256];
         int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
         if (ret <= 0) {
@@ -1471,15 +1469,15 @@ static esp_err_t api_scan_settings_handler(httpd_req_t *req) {
         }
         buf[ret] = '\0';
         
-        // Parsitaan JSON (yksinkertainen string-haku)
+        // Parse JSON (simple string search)
         char *enabled_str = strstr(buf, "\"masterBleEnabled\":");
         if (enabled_str) {
             enabled_str += strlen("\"masterBleEnabled\":");
             while (*enabled_str == ' ') enabled_str++;
             master_ble_enabled = (strncmp(enabled_str, "true", 4) == 0);
-            ESP_LOGI(TAG, "⚙️ Master BLE skannaus: %s", master_ble_enabled ? "KÄYTÖSSÄ" : "POIS KÄYTÖSTÄ");
+            ESP_LOGI(TAG, "⚙️ Master BLE scan: %s", master_ble_enabled ? "ENABLED" : "DISABLED");
             
-            // Tallenna NVS:ään
+            // Save to NVS
             nvs_handle_t nvs;
             if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
                 nvs_set_u8(nvs, "scan_master", master_ble_enabled ? 1 : 0);
@@ -1494,12 +1492,12 @@ static esp_err_t api_scan_settings_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// API: Palauta kaikki NÄKYVÄT laitteet JSON-muodossa (tai kaikki jos ?all=1)
+// API: Return all VISIBLE devices as JSON (or all if ?all=1)
 static esp_err_t api_devices_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_type(req, "application/json");
     
-    // Tarkista onko parametri ?all=1
+    // Check if parameter ?all=1
     bool show_all = false;
     char query[64];
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
@@ -1509,7 +1507,7 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
         }
     }
     
-    ESP_LOGI(TAG, "API /api/devices kutsuttu, laitteet yhteensä: %d, show_all=%d", device_count, show_all);
+    ESP_LOGI(TAG, "API /api/devices called, devices total: %d, show_all=%d", device_count, show_all);
     
     char *json = malloc(16384);
     if (!json) {
@@ -1522,16 +1520,16 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
     
     uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-    // Kerää näkyvät (tai kaikki) indeksit ja lajittele MAC-osoitteen mukaan
+    // Collect visible (or all) indices and sort by MAC address
     int indices[MAX_DEVICES];
     int count = 0;
     for (int i = 0; i < device_count; i++) {
         if (!show_all && !devices[i].visible) {
             continue;
         }
-        // Ohita master-laitteet jos master BLE on pois päältä
+        // Skip master devices if master BLE is disabled
         if (!master_ble_enabled) {
-            // Jos lähde on "local" tai tyhjä, se on master-laite
+            // If the source is "local" or empty, it's a master device
             if (devices[i].source[0] == '\0' || strcmp(devices[i].source, "local") == 0) {
                 continue;
             }
@@ -1539,7 +1537,7 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
         indices[count++] = i;
     }
 
-    // Yksinkertainen bubble sort MAC-osoitteen (addr) mukaan
+    // Simple bubble sort by MAC address (addr)
     for (int i = 0; i < count - 1; i++) {
         for (int j = 0; j < count - i - 1; j++) {
             ble_device_t *a = &devices[indices[j]];
@@ -1567,21 +1565,20 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
         }
 
         if (devices[i].has_sensor_data) {
-            // Määritä mitä kenttiä laite tukee
+            // Determine which fields the device supports
             uint16_t available = 0;
             if (devices[i].temperature != 0) available |= FIELD_TEMP;
             if (devices[i].humidity != 0) available |= FIELD_HUM;
             if (devices[i].battery_pct != 0) available |= FIELD_BAT;
             if (devices[i].battery_mv != 0) available |= FIELD_BATMV;
-            available |= FIELD_RSSI; // RSSI aina saatavilla
-            available |= FIELD_AGE;  // Päivitysikä aina saatavilla
+            available |= FIELD_RSSI; // RSSI always available
+            available |= FIELD_AGE;  // Update age always available
             
             snprintf(item, sizeof(item),
                 "%s{\"addr\":\"%s\",\"name\":\"%s\",\"advName\":\"%s\",\"rssi\":%d,"
                 "\"hasSensor\":true,\"temp\":%.1f,\"hum\":%d,\"bat\":%d,\"batMv\":%d,"
                 "\"firmware\":\"%s\",\"source\":\"%s\","
-                "\"saved\":%s,\"showMac\":%s,\"showIp\":%s,\"fieldMask\":%d,\"availableFields\":%d,\"ageSec\":%lu,"
-                "\"advIntervalMsLast\":%lu,\"advIntervalMsAvg\":%lu}",
+                "\"saved\":%s,\"showMac\":%s,\"showIp\":%s,\"fieldMask\":%d,\"availableFields\":%d,\"ageSec\":%lu}",
                 first ? "" : ",",
                 addr_str,
                 devices[i].name[0] ? devices[i].name : "Unknown",
@@ -1598,14 +1595,11 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
                 devices[i].show_ip ? "true" : "false",
                 devices[i].field_mask,
                 available,
-                (unsigned long)age_sec,
-                (unsigned long)devices[i].adv_interval_ms_last,
-                (unsigned long)devices[i].adv_interval_ms_avg);
+                (unsigned long)age_sec);
         } else {
             snprintf(item, sizeof(item),
                 "%s{\"addr\":\"%s\",\"name\":\"%s\",\"advName\":\"%s\",\"rssi\":%d,"
-                "\"hasSensor\":false,\"source\":\"%s\",\"saved\":%s,\"showMac\":%s,\"showIp\":%s,\"fieldMask\":%d,\"availableFields\":%d,\"ageSec\":%lu,"
-                "\"advIntervalMsLast\":%lu,\"advIntervalMsAvg\":%lu}",
+                "\"hasSensor\":false,\"source\":\"%s\",\"saved\":%s,\"showMac\":%s,\"showIp\":%s,\"fieldMask\":%d,\"availableFields\":%d,\"ageSec\":%lu}",
                 first ? "" : ",",
                 addr_str,
                 devices[i].name[0] ? devices[i].name : "Unknown",
@@ -1617,9 +1611,7 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
                 devices[i].show_ip ? "true" : "false",
                 devices[i].field_mask,
                 FIELD_RSSI | FIELD_AGE,
-                (unsigned long)age_sec,
-                (unsigned long)devices[i].adv_interval_ms_last,
-                (unsigned long)devices[i].adv_interval_ms_avg); // Vain RSSI saatavilla
+                (unsigned long)age_sec); // Only RSSI available
         }
         strcat(json, item);
         first = false;
@@ -1641,7 +1633,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
     }
     buf[ret] = '\0';
     
-    // Hae lähettäjän IP-osoite
+    // Get sender IP address
     char client_ip[16] = {0};
     struct sockaddr_in6 client_addr;
     socklen_t addr_len = sizeof(client_addr);
@@ -1651,7 +1643,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
         ESP_LOGI(TAG, "  X-Forwarded-For: %s", client_ip);
     } else {
         ESP_LOGI(TAG, "  No X-Forwarded-For header");
-        // Jos X-Forwarded-For ei löydy, käytä suoraa yhteyttä
+        // If X-Forwarded-For is missing, use direct connection
         int sockfd = httpd_req_to_sockfd(req);
         ESP_LOGI(TAG, "  Socket FD: %d", sockfd);
         
@@ -1664,11 +1656,11 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                 inet_ntoa_r(addr_in->sin_addr, client_ip, sizeof(client_ip));
                 ESP_LOGI(TAG, "  IPv4 address: %s", client_ip);
             } else if (client_addr.sin6_family == AF_INET6) {
-                // IPv6-osoite
+                // IPv6 address
                 char ipv6_str[INET6_ADDRSTRLEN];
                 inet_ntop(AF_INET6, &client_addr.sin6_addr, ipv6_str, sizeof(ipv6_str));
                 ESP_LOGI(TAG, "  IPv6 address: %s", ipv6_str);
-                // Kokeile muuttaa IPv4:ksi jos on IPv4-mapped
+                // Try to map to IPv4 if it's IPv4-mapped
                 if (IN6_IS_ADDR_V4MAPPED(&client_addr.sin6_addr)) {
                     struct in_addr ipv4_addr;
                     memcpy(&ipv4_addr, &client_addr.sin6_addr.s6_addr[12], 4);
@@ -1725,12 +1717,12 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
         ESP_LOGI(TAG, "  📛 Satellite JSON name: (none)");
     }
     
-    // Parse MAC address (satelliitti käyttää normaalia järjestystä)
+    // Parse MAC address (satellite uses normal order)
     uint8_t mac_addr[6];
     if (sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
                &mac_addr[0], &mac_addr[1], &mac_addr[2], &mac_addr[3], &mac_addr[4], &mac_addr[5]) == 6) {
         
-        // LOG: Satelliittihavainto
+        // LOG: Satellite observation
         ESP_LOGI(TAG, "🛰️  SATELLITE: %s, RSSI: %d dBm, hex_len: %d, from: %s",
                  mac_str, rssi, strlen(hex_data), client_ip);
         
@@ -1744,7 +1736,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
         }
         
         if (idx < 0 && device_count < MAX_DEVICES) {
-            // New device from satellite (oletuksena PIILOTETTU, näkyy vasta kun valitaan scan-valikossa)
+            // New device from satellite (default HIDDEN, shown only after selection in scan menu)
             idx = device_count++;
             memcpy(devices[idx].addr, mac_addr, 6);
             devices[idx].visible = load_visibility(mac_addr);
@@ -1761,10 +1753,6 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
             }
             devices[idx].has_sensor_data = false;
             devices[idx].last_sensor_seen = 0;
-            devices[idx].last_adv_seen = 0;
-            devices[idx].adv_interval_ms_last = 0;
-            devices[idx].adv_interval_ms_avg = 0;
-            devices[idx].adv_interval_samples = 0;
             snprintf(devices[idx].source, sizeof(devices[idx].source), "satellite-%s", client_ip);
             
             ESP_LOGI(TAG, "🛰️  New satellite device: %s from %s", mac_str, client_ip);
@@ -1773,27 +1761,13 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
         if (idx >= 0) {
             sat_adv_count++;
             
-            // Lähde = satelliitti aina kun satelliittihavainto tulee
+            // Source = satellite whenever a satellite observation arrives
             snprintf(devices[idx].source, sizeof(devices[idx].source), "satellite-%s", client_ip);
             
-            // Päivitä RSSI ja aikaleima aina
+            // Always update RSSI and timestamp
             devices[idx].rssi = rssi;
             uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
             devices[idx].last_seen = now_ms;
-            if (devices[idx].last_adv_seen > 0 && now_ms >= devices[idx].last_adv_seen) {
-                uint32_t delta = now_ms - devices[idx].last_adv_seen;
-                devices[idx].adv_interval_ms_last = delta;
-                if (devices[idx].adv_interval_samples == 0) {
-                    devices[idx].adv_interval_ms_avg = delta;
-                } else {
-                    uint64_t sum = (uint64_t)devices[idx].adv_interval_ms_avg * devices[idx].adv_interval_samples + delta;
-                    devices[idx].adv_interval_ms_avg = (uint32_t)(sum / (devices[idx].adv_interval_samples + 1));
-                }
-                if (devices[idx].adv_interval_samples < UINT32_MAX) {
-                    devices[idx].adv_interval_samples++;
-                }
-            }
-            devices[idx].last_adv_seen = now_ms;
             
             // Convert hex string to bytes and parse BLE advertisement data
             uint8_t raw_data[128];
@@ -1809,14 +1783,14 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
             ESP_LOGI(TAG, "  🔍 Parse fields result: %d, data_len: %d", parse_result, data_len);
             
             if (parse_result == 0) {
-                // Mainosnimi (adv_name) päivittyy vain jos käyttäjä ei ole antanut omaa nimeä
+                // adv_name updates only if the user hasn't set a custom name
                 if (json_name[0] != '\0') {
                     int copy_len = (strlen(json_name) < MAX_NAME_LEN - 1) ? (int)strlen(json_name) : MAX_NAME_LEN - 1;
                     if (!devices[idx].user_named) {
                         memcpy(devices[idx].adv_name, json_name, copy_len);
                         devices[idx].adv_name[copy_len] = '\0';
                     }
-                    // Päivitä name jos tyhjä, alkaa "Sat-", tai on sama kuin MAC-osoite
+                    // Update name if empty, starts with "Sat-", or equals MAC address
                     bool should_update_name = false;
                     if (!devices[idx].user_named && devices[idx].name[0] == '\0') {
                         should_update_name = true;
@@ -1851,7 +1825,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
                         memcpy(devices[idx].adv_name, fields.name, copy_len);
                         devices[idx].adv_name[copy_len] = '\0';
                     }
-                    // Päivitä name jos tyhjä, alkaa "Sat-", tai on sama kuin MAC-osoite
+                    // Update name if empty, starts with "Sat-", or equals MAC address
                     bool should_update_name = false;
                     if (!devices[idx].user_named && devices[idx].name[0] == '\0') {
                         should_update_name = true;
@@ -1952,7 +1926,7 @@ static esp_err_t api_satellite_data_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// API: Vaihda laitteen näkyvyys
+// API: Change device visibility
 static esp_err_t api_toggle_visibility_handler(httpd_req_t *req) {
     char content[256];
     int ret = httpd_req_recv(req, content, sizeof(content) - 1);
@@ -1993,16 +1967,16 @@ static esp_err_t api_toggle_visibility_handler(httpd_req_t *req) {
         decoded[j] = '\0';
         strcpy(addr_str, decoded);
         
-        ESP_LOGI(TAG, "Dekoodattu osoite: %s", addr_str);
+        ESP_LOGI(TAG, "Decoded address: %s", addr_str);
     }
     
     if (visible_param) {
         sscanf(visible_param, "visible=%d", &visible);
     }
     
-    ESP_LOGI(TAG, "API pyydetään piilottamaan: %s -> visible=%d", addr_str, visible);
+    ESP_LOGI(TAG, "API request to set visibility: %s -> visible=%d", addr_str, visible);
     
-    // Etsi laite ja päivitä sen tila
+    // Find device and update its state
     for (int i = 0; i < device_count; i++) {
         char dev_addr[18];
         snprintf(dev_addr, sizeof(dev_addr), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -2010,26 +1984,26 @@ static esp_err_t api_toggle_visibility_handler(httpd_req_t *req) {
             devices[i].addr[3], devices[i].addr[4], devices[i].addr[5]);
         
         if (strcmp(dev_addr, addr_str) == 0) {
-            ESP_LOGI(TAG, "Laite löytyi indeksistä %d, vanha visible=%d", i, devices[i].visible);
+            ESP_LOGI(TAG, "Device found at index %d, previous visible=%d", i, devices[i].visible);
             devices[i].visible = visible ? true : false;
             save_visibility(devices[i].addr, devices[i].visible);
-            ESP_LOGI(TAG, "✓ Laitteen %d näkyvyys päivitetty -> %d", i, devices[i].visible);
+            ESP_LOGI(TAG, "✓ Device %d visibility updated -> %d", i, devices[i].visible);
             break;
         }
     }
     
-    ESP_LOGI(TAG, "Vastaus lähetetty");
+    ESP_LOGI(TAG, "Response sent");
     
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
 }
 
-// API: Poista kaikkien laitteiden näkyvyysvalinnat (myös NVS:stä)
+// API: Clear visibility selections for all devices (also from NVS)
 static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
     int cleared_nvs = 0;
     int cleared_devices = 0;
 
-    // Piilota kaikki laitteet, älä poista listaa
+    // Hide all devices; do not remove the list
     for (int i = 0; i < device_count; i++) {
         if (devices[i].visible) {
             devices[i].visible = false;
@@ -2039,7 +2013,7 @@ static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
         }
     }
 
-    // Poista vain näkyvyysavaimet NVS:stä (12 hex-merkkiä)
+    // Remove only visibility keys from NVS (12 hex chars)
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_iterator_t it = NULL;
@@ -2071,7 +2045,7 @@ static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
         nvs_close(nvs);
     }
 
-    ESP_LOGI(TAG, "🗑️ Näkyvyys nollattu: %d laitetta piilotettu, %d NVS-avainta poistettu", cleared_devices, cleared_nvs);
+    ESP_LOGI(TAG, "🗑️ Visibility reset: %d devices hidden, %d NVS keys removed", cleared_devices, cleared_nvs);
 
     char response[128];
     snprintf(response, sizeof(response), "{\"ok\":true,\"cleared\":%d,\"nvs_cleared\":%d}", cleared_devices, cleared_nvs);
@@ -2080,11 +2054,11 @@ static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// Tunnista laitteen "signatuuri" (mitkä kentät sillä on)
+// Identify device "signature" (which fields it has)
 static uint16_t get_device_signature(const ble_device_t *dev) {
     uint16_t sig = 0;
     if (dev->has_sensor_data) {
-        sig |= (1 << 0); // On sensor-laite
+        sig |= (1 << 0); // Is a sensor device
         if (dev->temperature != 0) sig |= (1 << 1);
         if (dev->humidity != 0) sig |= (1 << 2);
         if (dev->battery_pct != 0) sig |= (1 << 3);
@@ -2113,7 +2087,7 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
     
     ESP_LOGI(TAG, "Update settings request: %s", buf);
     
-    // Parsitaan parametrit: addr, name, show_mac, show_ip, field_mask, apply_to_similar
+    // Parse parameters: addr, name, show_mac, show_ip, field_mask, apply_to_similar
     char addr_str[64] = {0};
     char name[MAX_NAME_LEN] = {0};
     int show_mac = 1;
@@ -2131,13 +2105,13 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
     if (addr_param) {
         sscanf(addr_param, "addr=%60[^&]", addr_str);
         
-        // URL-dekoodaus
+        // URL decode
         char decoded[64];
         int j = 0;
         for (int i = 0; addr_str[i] && j < 63; i++) {
             if (addr_str[i] == '%' && addr_str[i+1] && addr_str[i+2]) {
                 char hex[3] = {addr_str[i+1], addr_str[i+2], 0};
-                // Tue sekä isoja että pieniä kirjaimia (%3A ja %3a)
+                // Support both uppercase and lowercase (%3A and %3a)
                 char c;
                 if (hex[0] >= 'a') hex[0] -= 32;
                 if (hex[1] >= 'a') hex[1] -= 32;
@@ -2156,7 +2130,7 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
     
     if (name_param) {
         sscanf(name_param, "&name=%60[^&]", name);
-        // URL-dekoodaus nimelle
+        // URL decode for name
         char decoded[MAX_NAME_LEN];
         int j = 0;
         for (int i = 0; name[i] && j < MAX_NAME_LEN-1; i++) {
@@ -2194,10 +2168,10 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
         sscanf(apply_param, "&apply_to_similar=%d", &apply_to_similar);
     }
     
-    ESP_LOGI(TAG, "Päivitetään laite: %s, name='%s', show_mac=%d, show_ip=%d, fields=0x%04X, apply=%d",
+    ESP_LOGI(TAG, "Updating device: %s, name='%s', show_mac=%d, show_ip=%d, fields=0x%04X, apply=%d",
              addr_str, name, show_mac, show_ip, field_mask, apply_to_similar);
     
-    // Etsi laite
+    // Find device
     int target_idx = -1;
     for (int i = 0; i < device_count; i++) {
         char dev_addr[18];
@@ -2212,44 +2186,44 @@ static esp_err_t api_update_settings_handler(httpd_req_t *req) {
     }
     
     if (target_idx == -1) {
-        ESP_LOGW(TAG, "Laitetta ei löytynyt: %s", addr_str);
+        ESP_LOGW(TAG, "Device not found: %s", addr_str);
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Device not found");
         return ESP_FAIL;
     }
     
-    // Päivitä laitteen asetukset
+    // Update device settings
     strncpy(devices[target_idx].name, name, MAX_NAME_LEN - 1);
     devices[target_idx].show_mac = (show_mac != 0);
     devices[target_idx].show_ip = (show_ip != 0);
     devices[target_idx].field_mask = field_mask;
     devices[target_idx].user_named = (name[0] != '\0');
     
-    // Tallenna asetukset
+    // Save settings
     save_device_settings(devices[target_idx].addr, name, devices[target_idx].show_mac, devices[target_idx].show_ip, field_mask, devices[target_idx].user_named);
     
-    // Jos apply_to_similar on asetettu, etsi samanlaiset laitteet
+    // If apply_to_similar is set, find similar devices
     int updated_count = 1;
     if (apply_to_similar) {
         uint16_t target_sig = get_device_signature(&devices[target_idx]);
-        ESP_LOGI(TAG, "Sovelletaan asetuksia samanlaisiin laitteisiin (signatuuri: 0x%04X)", target_sig);
+        ESP_LOGI(TAG, "Apply settings to similar devices (signature: 0x%04X)", target_sig);
         
         for (int i = 0; i < device_count; i++) {
             if (i == target_idx) continue;
             
             uint16_t sig = get_device_signature(&devices[i]);
             if (sig == target_sig) {
-                // Sovella vain show_mac, show_ip ja field_mask, ei nimeä!
+                // Apply only show_mac, show_ip, and field_mask, not the name!
                 devices[i].show_mac = devices[target_idx].show_mac;
                 devices[i].show_ip = devices[target_idx].show_ip;
                 devices[i].field_mask = devices[target_idx].field_mask;
                 save_device_settings(devices[i].addr, devices[i].name, devices[i].show_mac, devices[i].show_ip, field_mask, devices[i].user_named);
                 updated_count++;
-                ESP_LOGI(TAG, "  Päivitetty: %02X:%02X:...", devices[i].addr[0], devices[i].addr[1]);
+                ESP_LOGI(TAG, "  Updated: %02X:%02X:...", devices[i].addr[0], devices[i].addr[1]);
             }
         }
     }
     
-    ESP_LOGI(TAG, "Päivitetty %d laitetta", updated_count);
+    ESP_LOGI(TAG, "Updated %d devices", updated_count);
     
     char response[128];
     snprintf(response, sizeof(response), "{\"ok\":true,\"updated\":%d}", updated_count);
@@ -2263,7 +2237,7 @@ static esp_err_t manifest_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/manifest+json");
     const char *manifest =
         "{"
-        "\"name\":\"BLE Laitteet\","
+        "\"name\":\"BLE Devices\","
         "\"short_name\":\"BLE Hub\","
         "\"start_url\":\"/\","
         "\"display\":\"standalone\","
@@ -2329,7 +2303,7 @@ static esp_err_t icon_png_handler(httpd_req_t *req) {
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 15;
+    config.max_uri_handlers = 25;
     config.stack_size = 8192;
     
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -2502,12 +2476,12 @@ static void start_webserver(void) {
         };
         httpd_register_uri_handler(server, &api_aio_delete);
         
-        ESP_LOGI(TAG, "HTTP-palvelin käynnistetty");
+        ESP_LOGI(TAG, "HTTP server started");
     }
 }
 
 void app_main() {
-    ESP_LOGI(TAG, "BLE Scanner + Web UI käynnistyy");
+    ESP_LOGI(TAG, "BLE Scanner + Web UI starting");
     
     // NVS alustus
     esp_err_t ret = nvs_flash_init();
@@ -2519,32 +2493,32 @@ void app_main() {
     
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
-        // Lataa master BLE skannauksen asetus
-        uint8_t master_ble_val = 1; // Oletuksena päällä
+        // Load master BLE scan setting
+        uint8_t master_ble_val = 1; // Enabled by default
         if (nvs_get_u8(nvs, "scan_master", &master_ble_val) == ESP_OK) {
             master_ble_enabled = (master_ble_val != 0);
-            ESP_LOGI(TAG, "📂 Ladattu asetus: Master BLE skannaus = %s", master_ble_enabled ? "KÄYTÖSSÄ" : "POIS KÄYTÖSTÄ");
+            ESP_LOGI(TAG, "📂 Loaded setting: Master BLE scan = %s", master_ble_enabled ? "ENABLED" : "DISABLED");
         }
         nvs_close(nvs);
     }
     
-    // Tarkista BOOT-nappi WiFi-nollausta varten
+    // Check BOOT button for WiFi reset
     check_boot_button();
     
-    // Lataa tallennetut laitteet NVS:stä
+    // Load saved devices from NVS
     load_all_devices_from_nvs();
-    ESP_LOGI(TAG, "Ladattu %d tallennettua laitetta NVS:stä", device_count);
+    ESP_LOGI(TAG, "Loaded %d saved devices from NVS", device_count);
     
     wifi_init();
     start_webserver();
 
-    // Käynnistä satelliittien discovery-broadcast
+    // Start satellite discovery broadcast
     xTaskCreate(discovery_broadcast_task, "discovery_broadcast", 4096, NULL, 4, NULL);
     
-    // Lataa Adafruit IO asetukset
+    // Load Adafruit IO settings
     load_aio_config();
     
-    // Käynnistä Adafruit IO ajastin jos asetukset on määritelty
+    // Start Adafruit IO timer if settings are configured
     if (aio_enabled && strlen(aio_username) > 0 && strlen(aio_key) > 0) {
         esp_timer_create_args_t aio_timer_args = {
             .callback = aio_timer_callback,
@@ -2552,10 +2526,10 @@ void app_main() {
         };
         esp_timer_create(&aio_timer_args, &aio_timer);
         esp_timer_start_periodic(aio_timer, AIO_SEND_INTERVAL_MS * 1000);  // Microsekunteja
-        ESP_LOGI(AIO_TAG, "Ajastin käynnistetty, lähetys %d min välein", AIO_SEND_INTERVAL_MS / 60000);
+        ESP_LOGI(AIO_TAG, "Timer started, send every %d min", AIO_SEND_INTERVAL_MS / 60000);
     }
 
-    // BLE-pakettitaajuuden lokitus
+    // BLE packet rate logging
     if (ble_rate_timer == NULL) {
         esp_timer_create_args_t rate_timer_args = {
             .callback = ble_rate_timer_callback,
@@ -2565,15 +2539,15 @@ void app_main() {
         esp_timer_start_periodic(ble_rate_timer, BLE_RATE_INTERVAL_MS * 1000);
     }
     
-    // BLE vain normaalitilassa, ei setup-modessa
+    // BLE only in normal mode, not setup mode
     if (!setup_mode) {
-        // Käynnistä BLE-stack, mutta EI aloita skannausta automaattisesti
+        // Start BLE stack, but do NOT start scanning automatically
         nimble_port_init();
         ble_hs_cfg.sync_cb = ble_app_on_sync;
         nimble_port_freertos_init(host_task);
         
-        ESP_LOGI(TAG, "Järjestelmä valmis. Skannaus odottaa käyttäjän komentoa.");
+        ESP_LOGI(TAG, "System ready. Scanning awaits user command.");
     } else {
-        ESP_LOGI(TAG, "Setup-tila aktiivinen. BLE ei käytössä.");
+        ESP_LOGI(TAG, "Setup mode active. BLE disabled.");
     }
 }
