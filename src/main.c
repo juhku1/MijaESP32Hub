@@ -10,6 +10,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #if __has_include("mdns.h")
@@ -92,6 +93,9 @@ static char aio_key[128] = {0};
 static bool aio_enabled = false;
 static uint8_t aio_feed_types = FIELD_TEMP | FIELD_HUM;  // Default temp + hum
 static esp_timer_handle_t aio_timer = NULL;
+static char d1_worker_url[256] = {0};
+static char d1_token[128] = {0};
+static bool d1_enabled = false;
 static esp_timer_handle_t ble_rate_timer = NULL;
 
 // BLE packet counters
@@ -734,6 +738,49 @@ static void save_aio_config(const char* username, const char* key, bool enabled,
     ESP_LOGI(AIO_TAG, "Settings saved, types=0x%02x", feed_types);
 }
 
+// Load D1 config from NVS
+static bool load_d1_config(void) {
+    nvs_handle_t nvs;
+    if (nvs_open("d1_config", NVS_READONLY, &nvs) != ESP_OK) {
+        return false;
+    }
+    
+    size_t url_len = sizeof(d1_worker_url);
+    size_t token_len = sizeof(d1_token);
+    uint8_t enabled_val = 0;
+    
+    esp_err_t err1 = nvs_get_str(nvs, "worker_url", d1_worker_url, &url_len);
+    esp_err_t err2 = nvs_get_str(nvs, "token", d1_token, &token_len);
+    nvs_get_u8(nvs, "enabled", &enabled_val);
+    
+    nvs_close(nvs);
+    
+    d1_enabled = (enabled_val == 1);
+    
+    return (err1 == ESP_OK && err2 == ESP_OK);
+}
+
+// Save D1 config to NVS
+static void save_d1_config(const char* worker_url, const char* token, bool enabled) {
+    nvs_handle_t nvs;
+    if (nvs_open("d1_config", NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for D1");
+        return;
+    }
+    
+    nvs_set_str(nvs, "worker_url", worker_url);
+    nvs_set_str(nvs, "token", token);
+    nvs_set_u8(nvs, "enabled", enabled ? 1 : 0);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    
+    strncpy(d1_worker_url, worker_url, sizeof(d1_worker_url) - 1);
+    strncpy(d1_token, token, sizeof(d1_token) - 1);
+    d1_enabled = enabled;
+    
+    ESP_LOGI(TAG, "D1 settings saved: %s, enabled=%d", worker_url, enabled);
+}
+
 static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -809,6 +856,74 @@ static void wifi_init(void) {
 // ============================================
 // ADAFRUIT IO DATA UPLOAD
 // ============================================
+
+// Send device data to Cloudflare D1
+static void send_device_to_d1(const ble_device_t *dev) {
+    if (!d1_enabled || !dev->has_sensor_data) return;
+    
+    // Build JSON payload with all device data
+    char *payload = malloc(1024);
+    if (!payload) {
+        ESP_LOGE(TAG, "Failed to allocate memory for D1 payload");
+        return;
+    }
+    
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             dev->addr[0], dev->addr[1], dev->addr[2], 
+             dev->addr[3], dev->addr[4], dev->addr[5]);
+    
+    int len = snprintf(payload, 1024, 
+        "{\"mac\":\"%s\",\"name\":\"%s\",\"data\":{",
+        mac_str,
+        dev->name[0] ? dev->name : "Unknown");
+    
+    bool first = true;
+    if (dev->field_mask & FIELD_TEMP) {
+        len += snprintf(payload + len, 1024 - len, "%s\"temperature\":%.2f", first ? "" : ",", dev->temperature);
+        first = false;
+    }
+    if (dev->field_mask & FIELD_HUM) {
+        len += snprintf(payload + len, 1024 - len, "%s\"humidity\":%d", first ? "" : ",", dev->humidity);
+        first = false;
+    }
+    if (dev->field_mask & FIELD_BAT) {
+        len += snprintf(payload + len, 1024 - len, "%s\"battery_mv\":%d", first ? "" : ",", dev->battery_mv);
+        first = false;
+    }
+    if (dev->field_mask & FIELD_RSSI) {
+        len += snprintf(payload + len, 1024 - len, "%s\"rssi\":%d", first ? "" : ",", dev->rssi);
+    }
+    
+    snprintf(payload + len, 1024 - len, "}}");
+    
+    // Send to D1 worker
+    char url[300];
+    snprintf(url, sizeof(url), "%s/data", d1_worker_url);
+    
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 10000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "Authorization", d1_token);
+    esp_http_client_set_post_field(client, payload, strlen(payload));
+    
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    
+    if (err == ESP_OK && status == 200) {
+        ESP_LOGI(TAG, "D1: Sent data for %s", dev->name[0] ? dev->name : mac_str);
+    } else {
+        ESP_LOGW(TAG, "D1: Failed to send %s (HTTP %d)", dev->name[0] ? dev->name : mac_str, status);
+    }
+    
+    esp_http_client_cleanup(client);
+    free(payload);
+}
 
 static void send_device_to_aio(const ble_device_t *dev) {
     if (!aio_enabled || !dev->has_sensor_data) return;
@@ -959,17 +1074,25 @@ static void send_device_to_aio(const ble_device_t *dev) {
 }
 
 static void aio_upload_task(void *arg) {
-    ESP_LOGI(AIO_TAG, "Starting data upload to Adafruit IO...");
+    ESP_LOGI(AIO_TAG, "Starting data upload...");
     
     int sent_count = 0;
     for (int i = 0; i < device_count; i++) {
         if (devices[i].visible && devices[i].has_sensor_data) {
-            send_device_to_aio(&devices[i]);
+            if (aio_enabled) {
+                send_device_to_aio(&devices[i]);
+            }
+            if (d1_enabled) {
+                send_device_to_d1(&devices[i]);
+            }
             sent_count++;
         }
     }
     
-    ESP_LOGI(AIO_TAG, "Sent %d devices", sent_count);
+    ESP_LOGI(TAG, "Upload complete: %d devices (AIO:%s, D1:%s)", 
+             sent_count, 
+             aio_enabled ? "✓" : "✗", 
+             d1_enabled ? "✓" : "✗");
     vTaskDelete(NULL);
 }
 
@@ -1412,6 +1535,121 @@ static esp_err_t api_aio_get_handler(httpd_req_t *req) {
              aio_feed_types);
     
     httpd_resp_sendstr(req, response);
+    return ESP_OK;
+}
+
+// API: Get D1 settings
+static esp_err_t api_d1_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    
+    char response[512];
+    snprintf(response, sizeof(response), 
+             "{\"ok\":true,\"workerUrl\":\"%s\",\"enabled\":%s,\"hasToken\":%s}",
+             d1_worker_url,
+             d1_enabled ? "true" : "false",
+             strlen(d1_token) > 0 ? "true" : "false");
+    
+    httpd_resp_sendstr(req, response);
+    return ESP_OK;
+}
+
+// API: Save D1 settings
+static esp_err_t api_d1_config_handler(httpd_req_t *req) {
+    char buf[512];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    char *url_start = strstr(buf, "\"workerUrl\":\"");
+    char *token_start = strstr(buf, "\"token\":\"");
+    char *enabled_start = strstr(buf, "\"enabled\":");
+    
+    if (!url_start || !token_start) {
+        const char* resp = "{\"ok\":false,\"error\":\"Invalid JSON\"}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    url_start += 13;
+    token_start += 10;
+    
+    char worker_url[256] = {0};
+    char token[128] = {0};
+    bool enabled = true;
+    
+    char *url_end = strchr(url_start, '"');
+    char *token_end = strchr(token_start, '"');
+    
+    if (url_end && token_end) {
+        int url_len = url_end - url_start;
+        int token_len = token_end - token_start;
+        
+        if (url_len > 0 && url_len < 256) {
+            strncpy(worker_url, url_start, url_len);
+        }
+        if (token_len > 0 && token_len < 128) {
+            strncpy(token, token_start, token_len);
+        }
+        
+        if (enabled_start) {
+            enabled_start += 10;
+            enabled = (strncmp(enabled_start, "true", 4) == 0);
+        }
+        
+        save_d1_config(worker_url, token, enabled);
+        
+        const char* resp = "{\"ok\":true}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    const char* resp = "{\"ok\":false,\"error\":\"Parse error\"}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// API: Test D1 connection
+static esp_err_t api_d1_test_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    
+    if (strlen(d1_worker_url) == 0 || strlen(d1_token) == 0) {
+        const char* resp = "{\"ok\":false,\"error\":\"D1 not configured\"}";
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    // Test connection with ping endpoint
+    char url[300];
+    snprintf(url, sizeof(url), "%s/ping", d1_worker_url);
+    
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 5000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "Authorization", d1_token);
+    
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    
+    if (err == ESP_OK && status == 200) {
+        const char* resp = "{\"ok\":true,\"message\":\"Connection successful!\"}";
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    } else {
+        char resp[128];
+        snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"Connection failed (HTTP %d)\"}", status);
+        httpd_resp_send(req, resp, strlen(resp));
+    }
+    
     return ESP_OK;
 }
 
@@ -2303,7 +2541,7 @@ static esp_err_t icon_png_handler(httpd_req_t *req) {
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 25;
+    config.max_uri_handlers = 30;
     config.stack_size = 8192;
     
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -2476,7 +2714,88 @@ static void start_webserver(void) {
         };
         httpd_register_uri_handler(server, &api_aio_delete);
         
+        httpd_uri_t api_d1_get = {
+            .uri = "/api/d1/config",
+            .method = HTTP_GET,
+            .handler = api_d1_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_d1_get);
+        
+        httpd_uri_t api_d1_config = {
+            .uri = "/api/d1/config",
+            .method = HTTP_POST,
+            .handler = api_d1_config_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_d1_config);
+        
+        httpd_uri_t api_d1_test = {
+            .uri = "/api/d1/test",
+            .method = HTTP_POST,
+            .handler = api_d1_test_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_d1_test);
+        
         ESP_LOGI(TAG, "HTTP server started");
+    }
+}
+
+// UART console task for factory reset
+static void uart_console_task(void *pvParameters) {
+    uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    };
+    uart_param_config(UART_NUM_0, &uart_config);
+    uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
+
+    char rx_buffer[128];
+    ESP_LOGI(TAG, "UART console ready. Type 'factory_reset' to erase all settings.");
+
+    while (1) {
+        int len = uart_read_bytes(UART_NUM_0, (uint8_t*)rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            rx_buffer[len] = '\0';
+            
+            // Remove newlines/carriage returns
+            for (int i = 0; i < len; i++) {
+                if (rx_buffer[i] == '\r' || rx_buffer[i] == '\n') {
+                    rx_buffer[i] = '\0';
+                    break;
+                }
+            }
+            
+            if (strlen(rx_buffer) > 0) {
+                ESP_LOGI(TAG, "Command received: %s", rx_buffer);
+                
+                if (strcmp(rx_buffer, "factory_reset") == 0) {
+                    ESP_LOGW(TAG, "🔥 FACTORY RESET initiated!");
+                    ESP_LOGW(TAG, "Erasing all NVS data (WiFi, Adafruit IO, Cloudflare D1, devices)...");
+                    
+                    // Erase all NVS partitions
+                    esp_err_t err = nvs_flash_erase();
+                    if (err == ESP_OK) {
+                        ESP_LOGI(TAG, "✅ Factory reset complete. Rebooting...");
+                        vTaskDelay(pdMS_TO_TICKS(1000));
+                        esp_restart();
+                    } else {
+                        ESP_LOGE(TAG, "❌ Factory reset failed: %s", esp_err_to_name(err));
+                    }
+                } else if (strcmp(rx_buffer, "help") == 0) {
+                    ESP_LOGI(TAG, "Available commands:");
+                    ESP_LOGI(TAG, "  factory_reset - Erase all settings and reboot");
+                    ESP_LOGI(TAG, "  help          - Show this help");
+                } else {
+                    ESP_LOGW(TAG, "Unknown command: %s (type 'help' for commands)", rx_buffer);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -2518,6 +2837,9 @@ void app_main() {
     // Load Adafruit IO settings
     load_aio_config();
     
+    // Load Cloudflare D1 settings
+    load_d1_config();
+    
     // Start Adafruit IO timer if settings are configured
     if (aio_enabled && strlen(aio_username) > 0 && strlen(aio_key) > 0) {
         esp_timer_create_args_t aio_timer_args = {
@@ -2550,4 +2872,7 @@ void app_main() {
     } else {
         ESP_LOGI(TAG, "Setup mode active. BLE disabled.");
     }
+    
+    // Start UART console for factory reset command
+    xTaskCreate(uart_console_task, "uart_console", 4096, NULL, 5, NULL);
 }

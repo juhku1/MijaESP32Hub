@@ -1,11 +1,11 @@
-# MijaESP32Hub (ESP32‑S3 BLE Hub)
+# MijiaESP32Hub (ESP32‑S3 BLE Hub)
 
 ![Hub](hubikuva.jpg)
 
 ESP32‑S3 BLE hub that scans BLE advertisements, parses sensor data, and exposes everything via a web UI and HTTP API. The system can be extended with ESP32‑C3 satellites that scan BLE and forward data to the hub.
 
 ## What is this for? (EN)
-If you have a few inexpensive Xiaomi/Mijia thermometers and want to collect them into a single web view on your local network, this does exactly that. It also lets you forward the data to cloud services so you can see temperatures outside your home network.
+If you have a few inexpensive Xiaomi Mijia thermometers and want to collect them into a single web view on your local network, this does exactly that. It also lets you forward the data to cloud services so you can see temperatures outside your home network.
 
 **Supported payloads / messages:** pvvx, ATC and BTHome v2 (Service Data UUID 0x181A / 0xFCD2) and Xiaomi MiBeacon (Manufacturer Data UUID 0xFE95).
 
@@ -15,7 +15,7 @@ https://pvvx.github.io/ATC_MiThermometer/TelinkMiFlasher.html
 Why it’s better: configurable advertising interval, richer payloads (more fields), more consistent readings, and generally better compatibility with BLE scanners.
 
 ## Mihin tätä käytetään? (FI)
-Jos sinulla on muutamia edullisia Xiaomi/Mijia‑mittareita ja haluat koota ne kotiverkkoon yhteen www‑näkymään, tämä auttaa siihen. Lisäksi sovellus mahdollistaa datan lähettämisen pilvipalveluihin, jotta näet lämpötilat myös kotiverkon ulkopuolelta.
+Jos sinulla on muutamia edullisia Xiaomi Mijia -mittareita ja haluat koota ne kotiverkkoon yhteen www-näkymään, tämä auttaa siihen. Lisäksi sovellus mahdollistaa datan lähettämisen pilvipalveluihin, jotta näet lämpötilat myös kotiverkon ulkopuolelta.
 
 **Tuetut viestit/payloadit:** pvvx, ATC ja BTHome v2 (Service Data UUID 0x181A / 0xFCD2) sekä Xiaomi MiBeacon (Manufacturer Data UUID 0xFE95).
 
@@ -36,7 +36,7 @@ Miksi se on parempi: säädettävä lähetysväli, rikkaammat payloadit (enemmä
 4. Hub merges local + satellite data and serves it in UI/API.
 
 ## Supported Devices & Firmware (tested)
-- **Xiaomi/Mijia LYWSD03MMC**
+- **Xiaomi Mijia LYWSD03MMC**
   - **pvvx custom firmware** (Service Data UUID 0x181A)
   - **ATC custom firmware** (Service Data UUID 0x181A)
   - **BTHome v2** (UUID 0xFCD2, e.g., pvvx firmware)
@@ -71,7 +71,7 @@ Miksi se on parempi: säädettävä lähetysväli, rikkaammat payloadit (enemmä
   - **Optional**: `name`, `type`, `temp`, `hum`, `bat`, `bat_mv`
 
 ## Satellite
-Satellite repo: https://github.com/juhku1/MijaESP32Satellite
+Satellite repo: https://github.com/juhku1/MijiaESP32Satellite
 
 ### Satellite Capabilities
 - Active BLE scan (includes adv name when available)
@@ -114,4 +114,4 @@ Wi‑Fi credentials are configured at compile time in the source code:
 ---
 
 ## Tiivistelmä (FI)
-ESP32‑S3 hubi skannaa BLE‑mainoksia, parsii mittaridatan ja näyttää sen web‑UI:ssa. ESP32‑C3‑satelliitit laajentavat peittoa ja forwardaavat datan hubille. Hubi broadcastaa `SATMASTER <IP> <port>` UDP:llä, satelliitit löytävät sen automaattisesti ja lähettävät **yksittäisen JSON‑objektin** per havainto `/api/satellite-data`‑endpointtiin. Tuetut mittarit: Mijia LYWSD03MMC (pvvx/ATC/BTHome v2) sekä Xiaomi MiBeacon‑payloadit.
+ESP32-S3 hubi skannaa BLE-mainoksia, parsii mittaridatan ja näyttää sen web-UI:ssa. ESP32-C3-satelliitit laajentavat peittoa ja forwardaavat datan hubille. Hubi broadcastaa `SATMASTER <IP> <port>` UDP:llä, satelliitit löytävät sen automaattisesti ja lähettävät **yksittäisen JSON-objektin** per havainto `/api/satellite-data`-endpointtiin. Tuetut mittarit: Xiaomi Mijia LYWSD03MMC (pvvx/ATC/BTHome v2) sekä Xiaomi MiBeacon-payloadit.

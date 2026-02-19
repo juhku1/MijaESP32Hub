@@ -1,0 +1,13 @@
+name = "mijaesp32hub-d1-worker"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# D1 Database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "mijaesp32hub"
+database_id = "YOUR_DATABASE_ID_HERE"
+
+# Environment variables
+[vars]
+# API_TOKEN will be set via wrangler secret put API_TOKEN
