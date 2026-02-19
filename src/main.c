@@ -61,7 +61,7 @@ typedef struct {
     bool user_named;  // Onko käyttäjä antanut oman nimen
     bool show_mac;  // Näytetäänkö MAC-osoite
     bool show_ip;  // Näytetäänkö satelliitti-IP
-    uint16_t field_mask;  // Bitmask: mitä kenttiä näytetään (temp, hum, bat, batMv, rssi)
+    uint16_t field_mask;  // Bitmask: mitä kenttiä näytetään (temp, hum, bat, batMv, rssi, age)
     bool has_sensor_data;
     float temperature;
     uint8_t humidity;
@@ -77,6 +77,7 @@ typedef struct {
 #define FIELD_BAT    (1 << 2)
 #define FIELD_BATMV  (1 << 3)
 #define FIELD_RSSI   (1 << 4)
+#define FIELD_AGE    (1 << 5)
 #define FIELD_ALL    0xFFFF  // Kaikki kentät oletuksena
 
 static ble_device_t devices[MAX_DEVICES];
@@ -1573,6 +1574,7 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
             if (devices[i].battery_pct != 0) available |= FIELD_BAT;
             if (devices[i].battery_mv != 0) available |= FIELD_BATMV;
             available |= FIELD_RSSI; // RSSI aina saatavilla
+            available |= FIELD_AGE;  // Päivitysikä aina saatavilla
             
             snprintf(item, sizeof(item),
                 "%s{\"addr\":\"%s\",\"name\":\"%s\",\"advName\":\"%s\",\"rssi\":%d,"
@@ -1614,7 +1616,7 @@ static esp_err_t api_devices_handler(httpd_req_t *req) {
                 devices[i].show_mac ? "true" : "false",
                 devices[i].show_ip ? "true" : "false",
                 devices[i].field_mask,
-                FIELD_RSSI,
+                FIELD_RSSI | FIELD_AGE,
                 (unsigned long)age_sec,
                 (unsigned long)devices[i].adv_interval_ms_last,
                 (unsigned long)devices[i].adv_interval_ms_avg); // Vain RSSI saatavilla
