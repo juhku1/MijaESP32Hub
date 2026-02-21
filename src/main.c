@@ -968,13 +968,14 @@ static void send_device_to_aio(const ble_device_t *dev) {
     
     // Feed key: MAC only (never changes even if device renamed)
     char feed_key[20];
-    snprintf(feed_key, sizeof(feed_key), "%02X%02X%02X%02X%02X%02X",
+    snprintf(feed_key, sizeof(feed_key), "%02x%02x%02x%02x%02x%02x",
              dev->addr[0], dev->addr[1], dev->addr[2], dev->addr[3], dev->addr[4], dev->addr[5]);
     
     // Send temperature
         if ((dev->field_mask & FIELD_TEMP) && (aio_feed_types & FIELD_TEMP)) {
         char feed_name[80];
         snprintf(feed_name, sizeof(feed_name), "%s-temp", feed_key);
+        ESP_LOGI(AIO_TAG, "📤 Sending to feed: %s (URL: /api/v2/%s/feeds/%s/data)", feed_name, aio_username, feed_name);
         snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds/%s/data", aio_username, feed_name);
         
         // Add metadata: device name and MAC
@@ -1081,11 +1082,18 @@ static void send_device_to_aio(const ble_device_t *dev) {
 }
 
 static void aio_upload_task(void *arg) {
-    ESP_LOGI(AIO_TAG, "Starting data upload...");
+    ESP_LOGI(AIO_TAG, "Starting data upload... (total devices: %d)", device_count);
     
     int sent_count = 0;
+    int visible_count = 0;
+    int has_data_count = 0;
+    
     for (int i = 0; i < device_count; i++) {
+        if (devices[i].visible) visible_count++;
+        if (devices[i].has_sensor_data) has_data_count++;
+        
         if (devices[i].visible && devices[i].has_sensor_data) {
+            ESP_LOGI(AIO_TAG, "Sending device %d: %s", i, devices[i].name);
             if (aio_enabled) {
                 send_device_to_aio(&devices[i]);
             }
@@ -1096,8 +1104,8 @@ static void aio_upload_task(void *arg) {
         }
     }
     
-    ESP_LOGI(TAG, "Upload complete: %d devices (AIO:%s, D1:%s)", 
-             sent_count, 
+    ESP_LOGI(TAG, "Upload complete: sent=%d, visible=%d, has_data=%d (AIO:%s, D1:%s)", 
+             sent_count, visible_count, has_data_count,
              aio_enabled ? "✓" : "✗", 
              d1_enabled ? "✓" : "✗");
     vTaskDelete(NULL);
@@ -1128,7 +1136,7 @@ static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
         if (!devices[i].visible || !devices[i].has_sensor_data) continue;
         
         char feed_key[20];
-        snprintf(feed_key, sizeof(feed_key), "%02X%02X%02X%02X%02X%02X",
+        snprintf(feed_key, sizeof(feed_key), "%02x%02x%02x%02x%02x%02x",
                  devices[i].addr[0], devices[i].addr[1], devices[i].addr[2], 
                  devices[i].addr[3], devices[i].addr[4], devices[i].addr[5]);
         
@@ -1233,7 +1241,7 @@ static esp_err_t api_aio_delete_feeds_handler(httpd_req_t *req) {
             
             // Generate feed key (MAC only)
             char feed_key[24];
-            snprintf(feed_key, sizeof(feed_key), "%02X%02X%02X%02X%02X%02X%s",
+            snprintf(feed_key, sizeof(feed_key), "%02x%02x%02x%02x%02x%02x%s",
                      devices[i].addr[0], devices[i].addr[1], devices[i].addr[2], 
                      devices[i].addr[3], devices[i].addr[4], devices[i].addr[5],
                      suffixes[t]);
@@ -1291,8 +1299,9 @@ static esp_err_t api_aio_send_now_handler(httpd_req_t *req) {
 // ============================================
 
 static esp_err_t root_get_handler(httpd_req_t *req) {
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Expires", "0");
     
     // Check if request came from AP interface (192.168.4.x)
     int sockfd = httpd_req_to_sockfd(req);
@@ -2322,7 +2331,7 @@ static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
         }
     }
 
-    // Remove only visibility keys from NVS (12 hex chars)
+    // Remove ALL device-related keys from NVS (visibility + settings)
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_iterator_t it = NULL;
@@ -2331,19 +2340,29 @@ static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
             nvs_entry_info_t info;
             nvs_entry_info(it, &info);
 
-            if (strlen(info.key) == 12) {
+            // Check if key starts with 12 hex chars (device MAC)
+            bool is_device_key = false;
+            if (strlen(info.key) >= 12) {
                 bool is_hex = true;
                 for (int i = 0; i < 12; i++) {
                     if (!((info.key[i] >= '0' && info.key[i] <= '9') ||
-                          (info.key[i] >= 'A' && info.key[i] <= 'F'))) {
+                          (info.key[i] >= 'A' && info.key[i] <= 'F') ||
+                          (info.key[i] >= 'a' && info.key[i] <= 'f'))) {
                         is_hex = false;
                         break;
                     }
                 }
+                // Accept keys like: AABBCCDDEEFF, AABBCCDDEEFF_n, AABBCCDDEEFF_m, etc.
                 if (is_hex) {
-                    if (nvs_erase_key(nvs, info.key) == ESP_OK) {
-                        cleared_nvs++;
+                    if (strlen(info.key) == 12 || info.key[12] == '_') {
+                        is_device_key = true;
                     }
+                }
+            }
+
+            if (is_device_key) {
+                if (nvs_erase_key(nvs, info.key) == ESP_OK) {
+                    cleared_nvs++;
                 }
             }
 
@@ -2360,6 +2379,115 @@ static esp_err_t api_clear_visibility_handler(httpd_req_t *req) {
     snprintf(response, sizeof(response), "{\"ok\":true,\"cleared\":%d,\"nvs_cleared\":%d}", cleared_devices, cleared_nvs);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, response);
+    return ESP_OK;
+}
+
+// API: Forget a specific device (remove from memory and NVS)
+static esp_err_t api_forget_device_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    
+    // Get MAC address from query string
+    char query[64];
+    char mac_str[16];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        const char* resp = "{\"ok\":false,\"error\":\"Missing query string\"}";
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    if (httpd_query_key_value(query, "mac", mac_str, sizeof(mac_str)) != ESP_OK) {
+        const char* resp = "{\"ok\":false,\"error\":\"Missing MAC parameter\"}";
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    // Validate MAC format (12 hex chars)
+    if (strlen(mac_str) != 12) {
+        const char* resp = "{\"ok\":false,\"error\":\"Invalid MAC format (need 12 hex chars)\"}";
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    // Convert to uppercase for consistency
+    for (int i = 0; i < 12; i++) {
+        mac_str[i] = toupper(mac_str[i]);
+        if (!((mac_str[i] >= '0' && mac_str[i] <= '9') || 
+              (mac_str[i] >= 'A' && mac_str[i] <= 'F'))) {
+            const char* resp = "{\"ok\":false,\"error\":\"Invalid MAC format (not hex)\"}";
+            httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
+    }
+    
+    // Parse MAC address
+    uint8_t target_mac[6];
+    for (int i = 0; i < 6; i++) {
+        char byte_str[3] = {mac_str[i*2], mac_str[i*2+1], '\0'};
+        target_mac[i] = (uint8_t)strtol(byte_str, NULL, 16);
+    }
+    
+    // Generate NVS key in reversed order (same as load_visibility)
+    char nvs_key[13];
+    snprintf(nvs_key, sizeof(nvs_key), "%02X%02X%02X%02X%02X%02X",
+             target_mac[5], target_mac[4], target_mac[3],
+             target_mac[2], target_mac[1], target_mac[0]);
+    
+    // Find device in list
+    int found_idx = -1;
+    for (int i = 0; i < device_count; i++) {
+        if (memcmp(devices[i].addr, target_mac, 6) == 0) {
+            found_idx = i;
+            break;
+        }
+    }
+    
+    if (found_idx == -1) {
+        const char* resp = "{\"ok\":false,\"error\":\"Device not found\"}";
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    // Remove ALL keys from NVS related to this device
+    int nvs_removed_count = 0;
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        // Remove visibility key (use reversed order like load_visibility)
+        if (nvs_erase_key(nvs, nvs_key) == ESP_OK) {
+            nvs_removed_count++;
+        }
+        
+        // Remove settings keys (FFEEDDCCBBAA_n, _m, _i, _f, _u)
+        const char* suffixes[] = {"_n", "_m", "_i", "_f", "_u"};
+        for (int i = 0; i < 5; i++) {
+            char key[24];
+            snprintf(key, sizeof(key), "%s%s", nvs_key, suffixes[i]);
+            if (nvs_erase_key(nvs, key) == ESP_OK) {
+                nvs_removed_count++;
+            }
+        }
+        
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    
+    // Remove from device list (shift remaining devices down)
+    char device_name[32];
+    strncpy(device_name, devices[found_idx].name, sizeof(device_name) - 1);
+    device_name[sizeof(device_name) - 1] = '\0';
+    
+    for (int i = found_idx; i < device_count - 1; i++) {
+        memcpy(&devices[i], &devices[i + 1], sizeof(ble_device_t));
+    }
+    device_count--;
+    
+    ESP_LOGI(TAG, "🗑️ Forgot device: %s (%s), NVS key: %s, removed: %d", 
+             mac_str, device_name, nvs_key, nvs_removed_count);
+    
+    char response[128];
+    snprintf(response, sizeof(response), 
+             "{\"ok\":true,\"mac\":\"%s\",\"name\":\"%s\",\"nvs_removed\":%d}", 
+             mac_str, device_name, nvs_removed_count);
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -2703,6 +2831,14 @@ static void start_webserver(void) {
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_clear_visibility);
+        
+        httpd_uri_t api_forget_device = {
+            .uri = "/api/forget-device",
+            .method = HTTP_POST,
+            .handler = api_forget_device_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_forget_device);
         
         httpd_uri_t api_update_settings = {
             .uri = "/api/update-settings",
