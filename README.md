@@ -63,6 +63,7 @@ Miksi se on parempi: säädettävä lähetysväli, rikkaammat payloadit (enemmä
 - **PWA** (add to home screen; no caching)
 - **HTTP API** (device data + satellite uplink)
 - **UDP discovery** (satellites auto‑find hub)
+- **Cloud integration** (Adafruit IO with automatic feed creation) - see [docs/adafruit_io.md](docs/adafruit_io.md)
 
 ## API
 - `GET /api/devices` – list devices with latest data

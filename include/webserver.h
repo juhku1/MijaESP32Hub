@@ -739,6 +739,7 @@ const char HTML_PAGE[] =
 "</div>"
 "<button onclick='saveAioSettings()' style='width:100%;padding:12px;background:#10b981;color:white;border:none;border-radius:8px;font-weight:600;cursor:pointer;margin-bottom:10px;'>💾 Save</button>"
 "<button onclick='createAioFeeds()' style='width:100%;padding:12px;background:#f59e0b;color:white;border:none;border-radius:8px;font-weight:600;cursor:pointer;margin-bottom:10px;'>🔧 Create feeds automatically</button>"
+"<div style='margin:0 0 10px 0;padding:8px;background:#0f172a;border-radius:6px;font-size:12px;color:#94a3b8;border-left:3px solid #10b981;'>ℹ️ Safe to run multiple times - won't overwrite or delete existing feeds</div>"
 "<button onclick='sendAioNow()' style='width:100%;padding:12px;background:#3b82f6;color:white;border:none;border-radius:8px;font-weight:600;cursor:pointer;margin-bottom:10px;'>📤 Test send</button>"
 "<a href='https://io.adafruit.com' target='_blank' style='display:block;width:100%;padding:10px;background:transparent;color:#94a3b8;border:1px solid #334155;border-radius:8px;font-weight:500;text-align:center;text-decoration:none;margin-bottom:10px;'>🗑️ Manage feeds manually at io.adafruit.com</a>"
 "<button onclick='openAioHelp()' style='width:100%;padding:10px;background:transparent;color:#94a3b8;border:1px solid #334155;border-radius:8px;font-weight:500;cursor:pointer;'>📖 Show detailed instructions</button>"
