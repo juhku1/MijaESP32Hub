@@ -1,8 +1,8 @@
-# MijiaESP32Hub (ESP32‑S3 BLE Hub)
+# MijiaESP32Hub (ESP32‑C3 BLE Hub)
 
 ![Hub](hubikuva.jpg)
 
-ESP32‑S3 BLE hub that scans BLE advertisements, parses sensor data, and exposes everything via a web UI and HTTP API. The system can be extended with ESP32‑C3 satellites that scan BLE and forward data to the hub.
+ESP32‑C3 BLE hub that scans BLE advertisements, parses sensor data, and exposes everything via a web UI and HTTP API. The system can be extended with additional ESP32‑C3 satellites that scan BLE and forward data to the hub.
 
 ## What is this for? (EN)
 If you have a few inexpensive Xiaomi Mijia thermometers and want to collect them into a single web view on your local network, this does exactly that. It also lets you forward the data to cloud services so you can see temperatures outside your home network.
@@ -46,13 +46,13 @@ Miksi se on parempi: säädettävä lähetysväli, rikkaammat payloadit (enemmä
 
 ## Hardware
 ### Hub
-- **Board**: ESP32‑S3‑DevKitC‑1
-- **Chip**: ESP32‑S3 (dual‑core, Wi‑Fi + BLE)
-- **Flash**: 8MB (typ.)
+- **Board**: ESP32‑C3‑DevKitM‑1
+- **Chip**: ESP32‑C3 (RISC-V single-core, Wi‑Fi + BLE)
+- **Flash**: 2MB
 - **USB**: Native USB‑Serial/JTAG
 
 ### Satellite
-- **Board**: ESP32‑C3‑DevKitM‑1
+- **Board**: ESP32‑C3‑DevKitM‑1 (same as hub)
 - **Chip**: ESP32‑C3 (RISC‑V, Wi‑Fi + BLE)
 - **Flash**: 2MB (typ.)
 
@@ -91,12 +91,12 @@ pip install platformio
 
 ### Build (Hub)
 ```bash
-platformio run --environment esp32-s3-devkitc-1
+platformio run --environment esp32-c3-devkitm-1
 ```
 
 ### Upload (Hub)
 ```bash
-platformio run --target upload --environment esp32-s3-devkitc-1 --upload-port /dev/ttyACM0
+platformio run --target upload --environment esp32-c3-devkitm-1 --upload-port /dev/ttyACM0
 ```
 
 ### Monitor
@@ -114,4 +114,4 @@ Wi‑Fi credentials are configured at compile time in the source code:
 ---
 
 ## Tiivistelmä (FI)
-ESP32-S3 hubi skannaa BLE-mainoksia, parsii mittaridatan ja näyttää sen web-UI:ssa. ESP32-C3-satelliitit laajentavat peittoa ja forwardaavat datan hubille. Hubi broadcastaa `SATMASTER <IP> <port>` UDP:llä, satelliitit löytävät sen automaattisesti ja lähettävät **yksittäisen JSON-objektin** per havainto `/api/satellite-data`-endpointtiin. Tuetut mittarit: Xiaomi Mijia LYWSD03MMC (pvvx/ATC/BTHome v2) sekä Xiaomi MiBeacon-payloadit.
+ESP32-C3 hubi skannaa BLE-mainoksia, parsii mittaridatan ja näyttää sen web-UI:ssa. Lisä-ESP32-C3-satelliitit laajentavat peittoa ja forwardaavat datan hubille. Hubi broadcastaa `SATMASTER <IP> <port>` UDP:llä, satelliitit löytävät sen automaattisesti ja lähettävät **yksittäisen JSON-objektin** per havainto `/api/satellite-data`-endpointtiin. Tuetut mittarit: Xiaomi Mijia LYWSD03MMC (pvvx/ATC/BTHome v2) sekä Xiaomi MiBeacon-payloadit.

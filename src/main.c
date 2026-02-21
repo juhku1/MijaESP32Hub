@@ -931,38 +931,10 @@ static void send_device_to_aio(const ble_device_t *dev) {
     char url[256];
     char payload[256];
     
-    // Feed key: use name if present, otherwise MAC
-    char feed_key[64];
-    char mac_str[20];
-    snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
+    // Feed key: MAC only (never changes even if device renamed)
+    char feed_key[20];
+    snprintf(feed_key, sizeof(feed_key), "%02x%02x%02x%02x%02x%02x",
              dev->addr[0], dev->addr[1], dev->addr[2], dev->addr[3], dev->addr[4], dev->addr[5]);
-    
-    if (strlen(dev->name) > 0) {
-        // Convert name to feed key: lowercase, spaces -> dashes
-        char safe_name[MAX_NAME_LEN];
-        int j = 0;
-        char prev = '\0';
-        for (int i = 0; i < strlen(dev->name) && j < sizeof(safe_name) - 1; i++) {
-            char c = dev->name[i];
-            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
-                safe_name[j++] = c;
-                prev = c;
-            } else if (c >= 'A' && c <= 'Z') {
-                safe_name[j++] = c + 32;  // Lowercase
-                prev = c + 32;
-            } else if (c == ' ' || c == '_' || c == '-') {
-                // Add dash only if previous wasn't a dash
-                if (prev != '-' && j > 0) {
-                    safe_name[j++] = '-';
-                    prev = '-';
-                }
-            }
-        }
-        safe_name[j] = '\0';
-        snprintf(feed_key, sizeof(feed_key), "%s-%s", safe_name, mac_str + 8);  // name + last 4 of MAC
-    } else {
-        snprintf(feed_key, sizeof(feed_key), "%s", mac_str);
-    }
     
     // Send temperature
         if ((dev->field_mask & FIELD_TEMP) && (aio_feed_types & FIELD_TEMP)) {
@@ -1111,37 +1083,11 @@ static void create_feeds_task(void *pvParameters) {
     for (int i = 0; i < device_count; i++) {
         if (!devices[i].visible || !devices[i].has_sensor_data) continue;
         
-        // Generate feed key
-        char feed_key[64];
-        char mac_str[20];
-        snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
+        // Generate feed key (MAC only - never changes even if device renamed)
+        char feed_key[20];
+        snprintf(feed_key, sizeof(feed_key), "%02x%02x%02x%02x%02x%02x",
                  devices[i].addr[0], devices[i].addr[1], devices[i].addr[2], 
                  devices[i].addr[3], devices[i].addr[4], devices[i].addr[5]);
-        
-        if (strlen(devices[i].name) > 0) {
-            char safe_name[MAX_NAME_LEN];
-            int j = 0;
-            char prev = '\0';
-            for (int k = 0; k < strlen(devices[i].name) && j < sizeof(safe_name) - 1; k++) {
-                char c = devices[i].name[k];
-                if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
-                    safe_name[j++] = c;
-                    prev = c;
-                } else if (c >= 'A' && c <= 'Z') {
-                    safe_name[j++] = c + 32;
-                    prev = c + 32;
-                } else if (c == ' ' || c == '_' || c == '-') {
-                    if (prev != '-' && j > 0) {
-                        safe_name[j++] = '-';
-                        prev = '-';
-                    }
-                }
-            }
-            safe_name[j] = '\0';
-            snprintf(feed_key, sizeof(feed_key), "%s-%s", safe_name, mac_str + 8);
-        } else {
-            snprintf(feed_key, sizeof(feed_key), "%s", mac_str);
-        }
         
         // Create temp feed
         if ((devices[i].field_mask & FIELD_TEMP) && (aio_feed_types & FIELD_TEMP)) {
@@ -1293,37 +1239,12 @@ static esp_err_t api_aio_delete_feeds_handler(httpd_req_t *req) {
         for (int i = 0; i < device_count; i++) {
             if (!devices[i].visible) continue;
             
-            // Generate feed key
-            char feed_key[64];
-            char mac_str[20];
-            snprintf(mac_str, sizeof(mac_str), "%02x%02x%02x%02x%02x%02x",
+            // Generate feed key (MAC only)
+            char feed_key[24];
+            snprintf(feed_key, sizeof(feed_key), "%02x%02x%02x%02x%02x%02x%s",
                      devices[i].addr[0], devices[i].addr[1], devices[i].addr[2], 
-                     devices[i].addr[3], devices[i].addr[4], devices[i].addr[5]);
-            
-            if (strlen(devices[i].name) > 0) {
-                char safe_name[MAX_NAME_LEN];
-                int j = 0;
-                char prev = '\0';
-                for (int k = 0; k < strlen(devices[i].name) && j < sizeof(safe_name) - 1; k++) {
-                    char c = devices[i].name[k];
-                    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
-                        safe_name[j++] = c;
-                        prev = c;
-                    } else if (c >= 'A' && c <= 'Z') {
-                        safe_name[j++] = c + 32;
-                        prev = c + 32;
-                    } else if (c == ' ' || c == '_' || c == '-') {
-                        if (prev != '-' && j > 0) {
-                            safe_name[j++] = '-';
-                            prev = '-';
-                        }
-                    }
-                }
-                safe_name[j] = '\0';
-                snprintf(feed_key, sizeof(feed_key), "%s-%s%s", safe_name, mac_str + 8, suffixes[t]);
-            } else {
-                snprintf(feed_key, sizeof(feed_key), "%s%s", mac_str, suffixes[t]);
-            }
+                     devices[i].addr[3], devices[i].addr[4], devices[i].addr[5],
+                     suffixes[t]);
             
             // Delete feed
             char url[256];
@@ -1727,6 +1648,57 @@ static esp_err_t api_scan_settings_handler(httpd_req_t *req) {
         httpd_resp_sendstr(req, "{\"ok\":true}");
     }
     
+    return ESP_OK;
+}
+
+// API: Diagnostics (crash logs, memory, boot count)
+static esp_err_t api_diagnostics_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    
+    // Get diagnostics from NVS
+    nvs_handle_t diag_nvs;
+    uint32_t boot_count = 0;
+    uint32_t last_reset = 0;
+    
+    if (nvs_open("diagnostics", NVS_READONLY, &diag_nvs) == ESP_OK) {
+        nvs_get_u32(diag_nvs, "boot_count", &boot_count);
+        nvs_get_u32(diag_nvs, "last_reset", &last_reset);
+        nvs_close(diag_nvs);
+    }
+    
+    // Reset reason strings
+    const char* reset_reasons[] = {
+        "UNKNOWN", "POWERON", "EXT", "SW", "PANIC", "INT_WDT",
+        "TASK_WDT", "WDT", "DEEPSLEEP", "BROWNOUT", "SDIO"
+    };
+    const char* reset_str = (last_reset < 11) ? reset_reasons[last_reset] : "UNKNOWN";
+    
+    // Memory stats
+    uint32_t free_heap = esp_get_free_heap_size();
+    uint32_t min_free_heap = esp_get_minimum_free_heap_size();
+    uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    
+    // Uptime
+    uint32_t uptime_sec = (uint32_t)(esp_timer_get_time() / 1000000);
+    
+    // BLE stats (total advertisements received)
+    uint32_t ble_rate = ble_adv_count;
+    
+    char response[512];
+    snprintf(response, sizeof(response),
+        "{\"bootCount\":%lu,"
+        "\"lastReset\":\"%s\","
+        "\"uptimeSec\":%lu,"
+        "\"freeHeap\":%lu,"
+        "\"minFreeHeap\":%lu,"
+        "\"largestBlock\":%lu,"
+        "\"bleAdvCount\":%lu,"
+        "\"deviceCount\":%d}",
+        boot_count, reset_str, uptime_sec,
+        free_heap, min_free_heap, largest_block,
+        ble_rate, device_count);
+    
+    httpd_resp_send(req, response, strlen(response));
     return ESP_OK;
 }
 
@@ -2541,7 +2513,7 @@ static esp_err_t icon_png_handler(httpd_req_t *req) {
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 30;
+    config.max_uri_handlers = 31;
     config.stack_size = 8192;
     
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -2600,6 +2572,14 @@ static void start_webserver(void) {
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_devices);
+        
+        httpd_uri_t api_diagnostics = {
+            .uri = "/api/diagnostics",
+            .method = HTTP_GET,
+            .handler = api_diagnostics_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_diagnostics);
         
         httpd_uri_t api_satellite_data = {
             .uri = "/api/satellite-data",
@@ -2802,6 +2782,14 @@ static void uart_console_task(void *pvParameters) {
 void app_main() {
     ESP_LOGI(TAG, "BLE Scanner + Web UI starting");
     
+    // Log reset reason for crash diagnostics
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    const char* reset_reason_str[] = {
+        "UNKNOWN", "POWERON", "EXT", "SW", "PANIC", "INT_WDT", 
+        "TASK_WDT", "WDT", "DEEPSLEEP", "BROWNOUT", "SDIO"
+    };
+    ESP_LOGW(TAG, "🔄 Reset reason: %s", reset_reason_str[reset_reason]);
+    
     // NVS alustus
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -2809,6 +2797,29 @@ void app_main() {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    
+    // Boot counter and crash tracking
+    nvs_handle_t diag_nvs;
+    uint32_t boot_count = 0;
+    if (nvs_open("diagnostics", NVS_READWRITE, &diag_nvs) == ESP_OK) {
+        nvs_get_u32(diag_nvs, "boot_count", &boot_count);
+        boot_count++;
+        nvs_set_u32(diag_nvs, "boot_count", boot_count);
+        nvs_set_u32(diag_nvs, "last_reset", (uint32_t)reset_reason);
+        nvs_commit(diag_nvs);
+        nvs_close(diag_nvs);
+        ESP_LOGI(TAG, "📊 Boot count: %lu (Reason: %s)", boot_count, reset_reason_str[reset_reason]);
+        
+        // Warn if crashed
+        if (reset_reason == ESP_RST_PANIC || reset_reason == ESP_RST_INT_WDT || 
+            reset_reason == ESP_RST_TASK_WDT || reset_reason == ESP_RST_WDT) {
+            ESP_LOGE(TAG, "⚠️ CRASH DETECTED! Last boot was abnormal. Check serial logs.");
+        }
+    }
+    
+    // Log free memory
+    ESP_LOGI(TAG, "💾 Free heap: %lu bytes (largest block: %lu bytes)", 
+             esp_get_free_heap_size(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {

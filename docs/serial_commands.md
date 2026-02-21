@@ -7,8 +7,8 @@
   - `pio device monitor -p /dev/ttyUSB0 -b 115200`
 
 ## Upload (firmware)
-- **Build + upload (esp32-s3-devkitc-1):**
-  - `pio run -e esp32-s3-devkitc-1 -t upload`
+- **Build + upload (esp32-c3-devkitm-1):**
+  - `pio run -e esp32-c3-devkitm-1 -t upload`
   - `pio device monitor -p /dev/ttyACM0 -b 115200`
 
 ## Close the port
@@ -18,6 +18,46 @@
 ## List ports
 - **List devices/ports:**
   - `pio device list`
+
+## Crash Diagnostics
+
+### Check device diagnostics in Web UI
+The main page now shows a **Diagnostics** section with:
+- **Boot Count**: How many times the device has restarted
+- **Last Reset**: Reason for last boot (POWERON, PANIC, TASK_WDT, etc.)
+- **Uptime**: Time since last boot
+- **Memory**: Free heap and largest allocatable block
+- **BLE Rate**: Bluetooth packets per 10 seconds
+
+### Reset reasons explained:
+- **POWERON**: Normal power-on or first boot ✅
+- **SW**: Software reset (normal reboot) ✅
+- **PANIC**: Firmware crash (check serial logs!) ⚠️
+- **TASK_WDT**: Task watchdog timeout (task stuck) ⚠️
+- **INT_WDT**: Interrupt watchdog timeout (interrupt stuck) ⚠️
+- **BROWNOUT**: Voltage too low (power supply issue) ⚠️
+
+### If device crashes repeatedly:
+1. **Check serial monitor** during crash:
+   ```bash
+   pio device monitor -b 115200
+   ```
+   Look for stack traces, error messages, or "Guru Meditation Error"
+
+2. **Check free memory** in diagnostics:
+   - If **minFreeHeap** < 30,000 bytes → memory leak likely
+   - If **largestBlock** is very small → heap fragmentation
+
+3. **Check boot count vs uptime**:
+   - High boot count but low uptime → device crashing frequently
+   - Example: 50 boots in 1 hour = crash every 72 seconds
+
+4. **Common crash causes**:
+   - Memory leak (heap running out)
+   - Stack overflow (recursive functions, large local variables)
+   - NULL pointer dereference
+   - HTTP client timeout during Cloudflare API calls
+   - Too many devices in scan list (>50)
 
 ## Console Commands
 
