@@ -83,6 +83,7 @@ static httpd_handle_t server = NULL;
 static bool setup_mode = false;
 static char wifi_ssid[64] = {0};
 static char wifi_password[64] = {0};
+static char ap_password[64] = "temperature";  // Default AP password
 static bool wifi_connected = false;
 static char master_ip[16] = {0};
 #if HAVE_MDNS
@@ -633,6 +634,46 @@ static bool load_wifi_config(void) {
     return false;
 }
 
+static void load_ap_password(void) {
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        ESP_LOGI(WIFI_TAG, "AP password not set, using default: temperature");
+        strcpy(ap_password, "temperature");
+        return;
+    }
+    
+    size_t pass_len = sizeof(ap_password);
+    esp_err_t err = nvs_get_str(nvs, "ap_password", ap_password, &pass_len);
+    nvs_close(nvs);
+    
+    if (err != ESP_OK || strlen(ap_password) < 8) {
+        ESP_LOGI(WIFI_TAG, "AP password invalid or too short, using default");
+        strcpy(ap_password, "temperature");
+    } else {
+        ESP_LOGI(WIFI_TAG, "AP password loaded from NVS");
+    }
+}
+
+static void save_ap_password(const char* password) {
+    if (strlen(password) < 8 || strlen(password) > 63) {
+        ESP_LOGE(WIFI_TAG, "AP password must be 8-63 characters");
+        return;
+    }
+    
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGE(WIFI_TAG, "Failed to open NVS for AP password");
+        return;
+    }
+    
+    nvs_set_str(nvs, "ap_password", password);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    
+    strcpy(ap_password, password);
+    ESP_LOGI(WIFI_TAG, "AP password saved");
+}
+
 static void save_wifi_config(const char* ssid, const char* password) {
     nvs_handle_t nvs;
     if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
@@ -793,63 +834,57 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
     
+    // Always create both STA and AP interfaces
+    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
+    
+    // Load AP password from NVS
+    load_ap_password();
+    
+    // AP configuration (always enabled)
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "BLE-Monitor",
+            .ssid_len = strlen("BLE-Monitor"),
+            .channel = 1,
+            .password = "",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    strncpy((char*)ap_config.ap.password, ap_password, sizeof(ap_config.ap.password));
+    
     // Check if WiFi is configured
     if (!load_wifi_config()) {
-        // No WiFi settings -> AP mode
-        ESP_LOGI(WIFI_TAG, "🔧 Setup mode: starting AP mode");
+        // No WiFi settings -> AP only mode
+        ESP_LOGI(WIFI_TAG, "🔧 Setup mode: AP only (no WiFi configured)");
         setup_mode = true;
         
-        esp_netif_create_default_wifi_ap();
-        
-        wifi_config_t ap_config = {
-            .ap = {
-                .ssid = "BLE-Monitor-Setup",
-                .ssid_len = strlen("BLE-Monitor-Setup"),
-                .channel = 1,
-                .password = "",
-                .max_connection = 4,
-                .authmode = WIFI_AUTH_OPEN,
-            },
-        };
-        
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
         ESP_ERROR_CHECK(esp_wifi_start());
         
-        ESP_LOGI(WIFI_TAG, "✓ AP started: BLE-Monitor-Setup");
-        ESP_LOGI(WIFI_TAG, "Open in browser: http://192.168.4.1");
+        ESP_LOGI(WIFI_TAG, "✓ AP started: BLE-Monitor");
+        ESP_LOGI(WIFI_TAG, "📱 Connect to: BLE-Monitor");
+        ESP_LOGI(WIFI_TAG, "🌐 Open browser: http://192.168.4.1");
     } else {
         // WiFi configured -> STA+AP mode (both enabled)
+        ESP_LOGI(WIFI_TAG, "🌐 Dual mode: Station + AP");
         ESP_LOGI(WIFI_TAG, "Connecting to network: %s", wifi_ssid);
         setup_mode = false;
-        
-        esp_netif_create_default_wifi_sta();
-        esp_netif_create_default_wifi_ap();
         
         // STA configuration
         wifi_config_t sta_config = {0};
         strncpy((char*)sta_config.sta.ssid, wifi_ssid, sizeof(sta_config.sta.ssid));
         strncpy((char*)sta_config.sta.password, wifi_password, sizeof(sta_config.sta.password));
         
-        // AP configuration (fallback access point)
-        wifi_config_t ap_config = {
-            .ap = {
-                .ssid = "BLE-Monitor",
-                .ssid_len = strlen("BLE-Monitor"),
-                .channel = 1,
-                .password = "",
-                .max_connection = 2,
-                .authmode = WIFI_AUTH_OPEN,
-            },
-        };
-        
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
         ESP_ERROR_CHECK(esp_wifi_start());
         
-        ESP_LOGI(WIFI_TAG, "✓ AP started: BLE-Monitor (fallback access point)");
-        ESP_LOGI(WIFI_TAG, "Vara-AP: http://192.168.4.1");
+        ESP_LOGI(WIFI_TAG, "✓ AP always on: BLE-Monitor");
+        ESP_LOGI(WIFI_TAG, "📱 Local access: http://192.168.4.1");
     }
 }
 
@@ -933,7 +968,7 @@ static void send_device_to_aio(const ble_device_t *dev) {
     
     // Feed key: MAC only (never changes even if device renamed)
     char feed_key[20];
-    snprintf(feed_key, sizeof(feed_key), "%02x%02x%02x%02x%02x%02x",
+    snprintf(feed_key, sizeof(feed_key), "%02X%02X%02X%02X%02X%02X",
              dev->addr[0], dev->addr[1], dev->addr[2], dev->addr[3], dev->addr[4], dev->addr[5]);
     
     // Send temperature
@@ -1075,115 +1110,6 @@ static void aio_timer_callback(void* arg) {
     xTaskCreate(aio_upload_task, "aio_upload", 8192, NULL, 5, NULL);
 }
 
-// API: Create feeds automatically
-// Background task for creating feeds
-static void create_feeds_task(void *pvParameters) {
-    int created = 0;
-    
-    for (int i = 0; i < device_count; i++) {
-        if (!devices[i].visible || !devices[i].has_sensor_data) continue;
-        
-        // Generate feed key (MAC only - never changes even if device renamed)
-        char feed_key[20];
-        snprintf(feed_key, sizeof(feed_key), "%02x%02x%02x%02x%02x%02x",
-                 devices[i].addr[0], devices[i].addr[1], devices[i].addr[2], 
-                 devices[i].addr[3], devices[i].addr[4], devices[i].addr[5]);
-        
-        // Create temp feed
-        if ((devices[i].field_mask & FIELD_TEMP) && (aio_feed_types & FIELD_TEMP)) {
-            char url[256];
-            char payload[256];
-            snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds", aio_username);
-            snprintf(payload, sizeof(payload), "{\"key\":\"%s-temp\",\"name\":\"%s Temperature\"}", 
-                     feed_key, devices[i].name[0] ? devices[i].name : "Device");
-            
-            esp_http_client_config_t config = {
-                .url = url,
-                .method = HTTP_METHOD_POST,
-                .crt_bundle_attach = esp_crt_bundle_attach,
-                .timeout_ms = 10000,
-            };
-            esp_http_client_handle_t client = esp_http_client_init(&config);
-            esp_http_client_set_header(client, "Content-Type", "application/json");
-            esp_http_client_set_header(client, "X-AIO-Key", aio_key);
-            esp_http_client_set_post_field(client, payload, strlen(payload));
-            
-            esp_err_t err = esp_http_client_perform(client);
-            int status = esp_http_client_get_status_code(client);
-            esp_http_client_cleanup(client);
-            
-            if (err == ESP_OK && (status == 200 || status == 201)) {
-                created++;
-                ESP_LOGI(AIO_TAG, "Created feed: %s-temp", feed_key);
-            }
-            vTaskDelay(pdMS_TO_TICKS(300));
-        }
-        
-        // Create hum feed
-        if ((devices[i].field_mask & FIELD_HUM) && (aio_feed_types & FIELD_HUM)) {
-            char url[256];
-            char payload[256];
-            snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds", aio_username);
-            snprintf(payload, sizeof(payload), "{\"key\":\"%s-hum\",\"name\":\"%s Humidity\"}", 
-                     feed_key, devices[i].name[0] ? devices[i].name : "Device");
-            
-            esp_http_client_config_t config = {
-                .url = url,
-                .method = HTTP_METHOD_POST,
-                .crt_bundle_attach = esp_crt_bundle_attach,
-                .timeout_ms = 10000,
-            };
-            esp_http_client_handle_t client = esp_http_client_init(&config);
-            esp_http_client_set_header(client, "Content-Type", "application/json");
-            esp_http_client_set_header(client, "X-AIO-Key", aio_key);
-            esp_http_client_set_post_field(client, payload, strlen(payload));
-            
-            esp_err_t err = esp_http_client_perform(client);
-            int status = esp_http_client_get_status_code(client);
-            esp_http_client_cleanup(client);
-            
-            if (err == ESP_OK && (status == 200 || status == 201)) {
-                created++;
-                ESP_LOGI(AIO_TAG, "Created feed: %s-hum", feed_key);
-            }
-            vTaskDelay(pdMS_TO_TICKS(300));
-        }
-        
-        // Create bat feed
-        if ((devices[i].field_mask & FIELD_BAT) && (aio_feed_types & FIELD_BAT)) {
-            char url[256];
-            char payload[256];
-            snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds", aio_username);
-            snprintf(payload, sizeof(payload), "{\"key\":\"%s-bat\",\"name\":\"%s Battery\"}", 
-                     feed_key, devices[i].name[0] ? devices[i].name : "Device");
-            
-            esp_http_client_config_t config = {
-                .url = url,
-                .method = HTTP_METHOD_POST,
-                .crt_bundle_attach = esp_crt_bundle_attach,
-                .timeout_ms = 10000,
-            };
-            esp_http_client_handle_t client = esp_http_client_init(&config);
-            esp_http_client_set_header(client, "Content-Type", "application/json");
-            esp_http_client_set_header(client, "X-AIO-Key", aio_key);
-            esp_http_client_set_post_field(client, payload, strlen(payload));
-            
-            esp_err_t err = esp_http_client_perform(client);
-            int status = esp_http_client_get_status_code(client);
-            esp_http_client_cleanup(client);
-            
-            if (err == ESP_OK && (status == 200 || status == 201)) {
-                created++;
-                ESP_LOGI(AIO_TAG, "Created feed: %s-bat", feed_key);
-            }
-            vTaskDelay(pdMS_TO_TICKS(300));
-        }
-    }
-    
-    ESP_LOGI(AIO_TAG, "Feed creation completed: %d feeds created", created);
-    vTaskDelete(NULL);
-}
-
 static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     
@@ -1193,11 +1119,77 @@ static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
         return ESP_OK;
     }
     
-    // Start background task for feed creation
-    xTaskCreate(create_feeds_task, "create_feeds", 8192, NULL, 5, NULL);
+    // Create feeds synchronously and return results
+    int created = 0;
+    int existed = 0;
+    int failed = 0;
     
-    const char* resp = "{\"ok\":true,\"message\":\"Creating feeds in background, check logs\"}";
-    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    for (int i = 0; i < device_count; i++) {
+        if (!devices[i].visible || !devices[i].has_sensor_data) continue;
+        
+        char feed_key[20];
+        snprintf(feed_key, sizeof(feed_key), "%02X%02X%02X%02X%02X%02X",
+                 devices[i].addr[0], devices[i].addr[1], devices[i].addr[2], 
+                 devices[i].addr[3], devices[i].addr[4], devices[i].addr[5]);
+        
+        // Try each feed type
+        const char* suffixes[3] = {"-temp", "-hum", "-bat"};
+        const char* names[3] = {"Temperature", "Humidity", "Battery"};
+        uint8_t type_bits[3] = {FIELD_TEMP, FIELD_HUM, FIELD_BAT};
+        
+        for (int t = 0; t < 3; t++) {
+            if (!(devices[i].field_mask & type_bits[t]) || !(aio_feed_types & type_bits[t])) continue;
+            
+            char url[256];
+            char payload[256];
+            snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds", aio_username);
+            snprintf(payload, sizeof(payload), "{\"key\":\"%s%s\",\"name\":\"%s %s\"}", 
+                     feed_key, suffixes[t], feed_key, names[t]);
+            
+            esp_http_client_config_t config = {
+                .url = url,
+                .method = HTTP_METHOD_POST,
+                .crt_bundle_attach = esp_crt_bundle_attach,
+                .timeout_ms = 10000,
+            };
+            esp_http_client_handle_t client = esp_http_client_init(&config);
+            esp_http_client_set_header(client, "Content-Type", "application/json");
+            esp_http_client_set_header(client, "X-AIO-Key", aio_key);
+            esp_http_client_set_post_field(client, payload, strlen(payload));
+            
+            esp_err_t err = esp_http_client_perform(client);
+            int status = esp_http_client_get_status_code(client);
+            esp_http_client_cleanup(client);
+            
+            if (err == ESP_OK) {
+                if (status == 200 || status == 201) {
+                    created++;
+                    ESP_LOGI(AIO_TAG, "✓ Created feed: %s%s", feed_key, suffixes[t]);
+                } else if (status == 422 || status == 409 || status == 400) {
+                    // 422 = Unprocessable Entity (already exists)
+                    // 409 = Conflict (already exists)
+                    // 400 = Bad Request (often means already exists in Adafruit IO)
+                    existed++;
+                    ESP_LOGI(AIO_TAG, "○ Feed already exists: %s%s (status: %d)", feed_key, suffixes[t], status);
+                } else {
+                    failed++;
+                    ESP_LOGW(AIO_TAG, "✗ Failed to create feed %s%s (status: %d)", feed_key, suffixes[t], status);
+                }
+            } else {
+                failed++;
+                ESP_LOGE(AIO_TAG, "✗ HTTP error creating %s%s: %s", feed_key, suffixes[t], esp_err_to_name(err));
+            }
+            vTaskDelay(pdMS_TO_TICKS(300));
+        }
+    }
+    
+    ESP_LOGI(AIO_TAG, "Feed creation completed: %d created, %d existed, %d failed", created, existed, failed);
+    
+    char response[256];
+    snprintf(response, sizeof(response), 
+             "{\"ok\":true,\"created\":%d,\"existed\":%d,\"failed\":%d}", 
+             created, existed, failed);
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -1241,7 +1233,7 @@ static esp_err_t api_aio_delete_feeds_handler(httpd_req_t *req) {
             
             // Generate feed key (MAC only)
             char feed_key[24];
-            snprintf(feed_key, sizeof(feed_key), "%02x%02x%02x%02x%02x%02x%s",
+            snprintf(feed_key, sizeof(feed_key), "%02X%02X%02X%02X%02X%02X%s",
                      devices[i].addr[0], devices[i].addr[1], devices[i].addr[2], 
                      devices[i].addr[3], devices[i].addr[4], devices[i].addr[5],
                      suffixes[t]);
@@ -1301,11 +1293,39 @@ static esp_err_t api_aio_send_now_handler(httpd_req_t *req) {
 static esp_err_t root_get_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
-    if (setup_mode) {
-        httpd_resp_send(req, SETUP_HTML_PAGE, HTTPD_RESP_USE_STRLEN);
-    } else {
-        httpd_resp_send(req, HTML_PAGE, HTTPD_RESP_USE_STRLEN);
+    
+    // Check if request came from AP interface (192.168.4.x)
+    int sockfd = httpd_req_to_sockfd(req);
+    struct sockaddr_in6 addr;
+    socklen_t addr_size = sizeof(addr);
+    
+    if (getpeername(sockfd, (struct sockaddr *)&addr, &addr_size) == 0) {
+        if (addr.sin6_family == AF_INET6) {
+            // Check for IPv4-mapped IPv6 address
+            if (IN6_IS_ADDR_V4MAPPED(&addr.sin6_addr)) {
+                uint32_t ipv4 = ((uint32_t *)&addr.sin6_addr)[3];
+                uint8_t *ip_bytes = (uint8_t *)&ipv4;
+                // Check if IP is 192.168.4.x (AP network)
+                if (ip_bytes[0] == 192 && ip_bytes[1] == 168 && ip_bytes[2] == 4) {
+                    // Request from AP -> show setup page
+                    httpd_resp_send(req, SETUP_HTML_PAGE, HTTPD_RESP_USE_STRLEN);
+                    return ESP_OK;
+                }
+            }
+        } else if (addr.sin6_family == AF_INET) {
+            struct sockaddr_in *addr_in = (struct sockaddr_in *)&addr;
+            uint8_t *ip_bytes = (uint8_t *)&addr_in->sin_addr.s_addr;
+            // Check if IP is 192.168.4.x (AP network)
+            if (ip_bytes[0] == 192 && ip_bytes[1] == 168 && ip_bytes[2] == 4) {
+                // Request from AP -> show setup page
+                httpd_resp_send(req, SETUP_HTML_PAGE, HTTPD_RESP_USE_STRLEN);
+                return ESP_OK;
+            }
+        }
     }
+    
+    // Request from STA or unknown -> show full UI
+    httpd_resp_send(req, HTML_PAGE, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -1350,16 +1370,27 @@ static esp_err_t api_setup_handler(httpd_req_t *req) {
             strncpy(password, pass_start, pass_len);
         }
         
-        // Save and restart
+        // Save WiFi config
         save_wifi_config(ssid, password);
         
         const char* resp = "{\"ok\":true}";
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
         
-        ESP_LOGI(WIFI_TAG, "WiFi configured, restarting...");
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        esp_restart();
+        // Update WiFi configuration without restart
+        ESP_LOGI(WIFI_TAG, "WiFi configured, reconnecting to: %s", ssid);
+        
+        wifi_config_t sta_config = {0};
+        strncpy((char*)sta_config.sta.ssid, ssid, sizeof(sta_config.sta.ssid));
+        strncpy((char*)sta_config.sta.password, password, sizeof(sta_config.sta.password));
+        
+        // Update STA config and reconnect
+        esp_wifi_set_config(WIFI_IF_STA, &sta_config);
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_wifi_connect();
+        
+        setup_mode = false;
         
         return ESP_OK;
     }
@@ -1367,6 +1398,74 @@ static esp_err_t api_setup_handler(httpd_req_t *req) {
     const char* resp = "{\"ok\":false,\"error\":\"Parse error\"}";
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// API: Get WiFi status (for setup page)
+static esp_err_t api_status_handler(httpd_req_t *req) {
+    char resp[128];
+    if (wifi_connected && master_ip[0] != '\0') {
+        snprintf(resp, sizeof(resp), "{\"connected\":true,\"ip\":\"%s\"}", master_ip);
+    } else {
+        snprintf(resp, sizeof(resp), "{\"connected\":false,\"ip\":\"\"}");
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// API: Set AP password
+static esp_err_t api_ap_password_handler(httpd_req_t *req) {
+    char buf[128];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    char *pass_start = strstr(buf, "\"password\":\"");
+    if (!pass_start) {
+        const char* resp = "{\"ok\":false,\"error\":\"Invalid JSON\"}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    pass_start += 12;  // Skip "password":"
+    char *pass_end = strchr(pass_start, '"');
+    if (!pass_end) {
+        const char* resp = "{\"ok\":false,\"error\":\"Parse error\"}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    int pass_len = pass_end - pass_start;
+    if (pass_len < 8 || pass_len > 63) {
+        const char* resp = "{\"ok\":false,\"error\":\"Password must be 8-63 chars\"}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    
+    char new_password[64];
+    strncpy(new_password, pass_start, pass_len);
+    new_password[pass_len] = '\0';
+    
+    save_ap_password(new_password);
+    
+    const char* resp = "{\"ok\":true,\"message\":\"AP password updated. Reconnect to BLE-Monitor\"}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    
+    // Update AP config
+    wifi_config_t ap_config = {0};
+    esp_wifi_get_config(WIFI_IF_AP, &ap_config);
+    strncpy((char*)ap_config.ap.password, new_password, sizeof(ap_config.ap.password));
+    ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    
     return ESP_OK;
 }
 
@@ -2652,6 +2751,22 @@ static void start_webserver(void) {
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &api_setup);
+        
+        httpd_uri_t api_status = {
+            .uri = "/api/status",
+            .method = HTTP_GET,
+            .handler = api_status_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_status);
+        
+        httpd_uri_t api_ap_password = {
+            .uri = "/api/ap-password",
+            .method = HTTP_POST,
+            .handler = api_ap_password_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &api_ap_password);
         
         httpd_uri_t api_aio_config = {
             .uri = "/api/aio/config",
