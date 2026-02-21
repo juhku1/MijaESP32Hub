@@ -105,7 +105,40 @@ platformio device monitor -p /dev/ttyACM0 -b 115200
 ```
 
 ## Configuration
-Wi‑Fi credentials are configured at compile time in the source code:
+
+### WiFi Setup via Web UI
+The hub operates in **dual WiFi mode** (Station + AP):
+- **AP Mode**: Always available at `BLE-Monitor` (192.168.4.1)
+- **Station Mode**: Connects to your home WiFi
+
+**First Setup:**
+1. Power on the device (no WiFi configured yet)
+2. Connect to WiFi network: `BLE-Monitor`
+   - **Default password**: `temperature`
+3. Open browser: http://192.168.4.1
+4. Enter your home WiFi credentials
+5. Device connects automatically and shows Station IP
+
+**AP Password Security:**
+- Default password: `temperature` (WPA2-PSK)
+- Change via setup page (http://192.168.4.1)
+- Password must be 8-63 characters
+- Stored in NVS (persistent across reboots)
+
+**Access Points:**
+- **Setup page** (192.168.4.1): WiFi config, AP password, basic settings
+- **Full UI** (Station IP): BLE device dashboard, data, diagnostics
+
+### Changing WiFi Network
+1. Connect to `BLE-Monitor` AP (password: `temperature` or your custom password)
+2. Navigate to http://192.168.4.1
+3. Enter new WiFi credentials
+4. Device reconnects **without restart** (no service interruption)
+
+### Legacy: Compile-time Configuration
+> **Note**: WiFi is now configured via web UI. Compile-time configuration is no longer required.
+
+If you prefer compile-time setup, modify these in the source:
 ```c
 #define WIFI_SSID "YourSSID"
 #define WIFI_PASSWORD "YourPassword"

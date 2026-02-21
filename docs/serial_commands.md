@@ -68,13 +68,36 @@ Once connected to the serial monitor, you can type these commands:
 factory_reset
 ```
 **⚠️ WARNING:** This erases ALL settings and reboots the device:
-- WiFi credentials (SSID, password)
+- WiFi credentials (SSID, password, AP password)
 - Adafruit IO configuration (username, AIO key, feed settings)
 - Cloudflare D1 configuration (Worker URL, token)
 - Device list (discovered BLE sensors)
 - Custom device names
 
-After reset, the device boots into **Setup Mode** (creates WiFi hotspot `MijiaESP32Hub-SETUP`).
+After reset, the device boots with:
+- **WiFi AP**: `BLE-Monitor` (always on)
+- **AP password**: `temperature` (default)
+- **Setup page**: http://192.168.4.1
+
+### WiFi Configuration Status
+```
+wifi_status
+```
+Shows current WiFi configuration:
+- Station SSID and connection status
+- Station IP address (if connected)
+- AP SSID and IP (always 192.168.4.1)
+- AP password status (default or custom)
+
+### Change AP Password via Serial
+```
+ap_password:<new_password>
+```
+Change the WiFi AP password (8-63 characters):
+```
+ap_password:MySecurePass123
+```
+**Note**: You can also change this via web UI at http://192.168.4.1
 
 ### Help
 ```
@@ -92,17 +115,35 @@ Shows available commands in the serial console.
 ## Use Cases for Factory Reset
 
 ### 1. Moving to a new WiFi network
-If you can't access the web UI to change WiFi settings (e.g., you moved the device to a new location):
+You have three options:
+
+**Option A: Web UI (recommended)**
+1. Connect to `BLE-Monitor` WiFi (password: `temperature` or your custom password)
+2. Navigate to http://192.168.4.1
+3. Enter new WiFi credentials
+4. Device reconnects without restart
+
+**Option B: Serial Console**
 1. Connect via USB and open serial monitor
 2. Type `factory_reset` and press Enter
-3. Device reboots into Setup Mode
-4. Connect to `MijiaESP32Hub-SETUP` WiFi and configure new network
+3. Device reboots with default settings
+4. Connect to `BLE-Monitor` WiFi (password: `temperature`)
+5. Configure via http://192.168.4.1
 
-### 2. Selling/giving away the device
+**Option C: Physical access not needed**
+- The AP is **always available** at `BLE-Monitor`
+- Even when connected to home WiFi, you can access setup at 192.168.4.1
+
+### 2. Forgot AP password
+If you changed the AP password and forgot it:
+1. Connect via USB serial monitor
+2. Type `ap_password:temperature` to reset to default
+3. Reconnect to `BLE-Monitor` with password `temperature`
+
+### 3. Selling/giving away the device
 Remove all personal data:
 - Cloud credentials (Adafruit IO, Cloudflare D1)
-- WiFi password
-- Device names you assigned
+- WiFi password- AP password (resets to `temperature`)- Device names you assigned
 
 ### 3. Troubleshooting corrupted settings
 If the device behaves unexpectedly or won't connect:
