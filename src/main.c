@@ -1118,6 +1118,53 @@ static void aio_timer_callback(void* arg) {
     xTaskCreate(aio_upload_task, "aio_upload", 8192, NULL, 5, NULL);
 }
 
+static void sanitize_json_string(const char* src, char* dst, size_t dst_size) {
+    if (!src || !dst || dst_size == 0) return;
+    size_t j = 0;
+    for (size_t i = 0; src[i] != '\0' && j + 1 < dst_size; i++) {
+        char c = src[i];
+        if (c == '"') {
+            c = '\'';
+        } else if ((unsigned char)c < 32) {
+            continue;
+        }
+        dst[j++] = c;
+    }
+    dst[j] = '\0';
+}
+
+static bool aio_update_feed_name(const char* feed_key_full, const char* full_name) {
+    if (!feed_key_full || !full_name || strlen(aio_username) == 0 || strlen(aio_key) == 0) return false;
+
+    char url[256];
+    char payload[256];
+    snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds/%s", aio_username, feed_key_full);
+    snprintf(payload, sizeof(payload), "{\"feed\":{\"name\":\"%s\"}}", full_name);
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_PUT,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 10000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "X-AIO-Key", aio_key);
+    esp_http_client_set_post_field(client, payload, strlen(payload));
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err == ESP_OK && (status == 200 || status == 201)) {
+        ESP_LOGI(AIO_TAG, "↻ Updated feed name: %s", feed_key_full);
+        return true;
+    }
+
+    ESP_LOGW(AIO_TAG, "✗ Failed to update feed name %s (status: %d)", feed_key_full, status);
+    return false;
+}
+
 static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     
@@ -1150,9 +1197,16 @@ static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
             
             char url[256];
             char payload[256];
+            char display_name[64];
+            char full_name[96];
+            char feed_key_full[32];
+            const char* raw_name = (strlen(devices[i].name) > 0) ? devices[i].name : feed_key;
+            sanitize_json_string(raw_name, display_name, sizeof(display_name));
+            snprintf(full_name, sizeof(full_name), "%s %s", display_name, names[t]);
+            snprintf(feed_key_full, sizeof(feed_key_full), "%s%s", feed_key, suffixes[t]);
             snprintf(url, sizeof(url), "https://io.adafruit.com/api/v2/%s/feeds", aio_username);
             snprintf(payload, sizeof(payload), "{\"key\":\"%s%s\",\"name\":\"%s %s\"}", 
-                     feed_key, suffixes[t], feed_key, names[t]);
+                     feed_key, suffixes[t], display_name, names[t]);
             
             esp_http_client_config_t config = {
                 .url = url,
@@ -1179,6 +1233,9 @@ static esp_err_t api_aio_create_feeds_handler(httpd_req_t *req) {
                     // 400 = Bad Request (often means already exists in Adafruit IO)
                     existed++;
                     ESP_LOGI(AIO_TAG, "○ Feed already exists: %s%s (status: %d)", feed_key, suffixes[t], status);
+                    if (strlen(devices[i].name) > 0) {
+                        aio_update_feed_name(feed_key_full, full_name);
+                    }
                 } else {
                     failed++;
                     ESP_LOGW(AIO_TAG, "✗ Failed to create feed %s%s (status: %d)", feed_key, suffixes[t], status);

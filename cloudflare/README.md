@@ -1,22 +1,7 @@
-# Cloudflare D1 Worker for MijiaESP32Hub
+# Cloud worker (unused)
 
-This directory contains the Cloudflare Worker that receives sensor data from ESP32 devices and stores it in a D1 SQLite database.
-
-## Quick Start
-
-1. **Install Wrangler CLI**:
-   ```bash
-   npm install -g wrangler
-   ```
-
-2. **Run setup script**:
-   ```bash
-   ./setup.sh
-   ```
-
-3. **Copy the Worker URL and API Token** to your ESP32 settings
-
-That's it! Your D1 archive is ready.
+This folder is currently not documented or required for the supported setup.
+Use Adafruit IO for cloud storage and dashboards.
 
 ## Files
 

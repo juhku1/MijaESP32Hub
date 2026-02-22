@@ -56,7 +56,7 @@ The main page now shows a **Diagnostics** section with:
    - Memory leak (heap running out)
    - Stack overflow (recursive functions, large local variables)
    - NULL pointer dereference
-   - HTTP client timeout during Cloudflare API calls
+  - HTTP client timeout during API calls
    - Too many devices in scan list (>50)
 
 ## Console Commands
@@ -70,7 +70,6 @@ factory_reset
 **⚠️ WARNING:** This erases ALL settings and reboots the device:
 - WiFi credentials (SSID, password, AP password)
 - Adafruit IO configuration (username, AIO key, feed settings)
-- Cloudflare D1 configuration (Worker URL, token)
 - Device list (discovered BLE sensors)
 - Custom device names
 
@@ -142,7 +141,7 @@ If you changed the AP password and forgot it:
 
 ### 3. Selling/giving away the device
 Remove all personal data:
-- Cloud credentials (Adafruit IO, Cloudflare D1)
+- Cloud credentials (Adafruit IO)
 - WiFi password- AP password (resets to `temperature`)- Device names you assigned
 
 ### 3. Troubleshooting corrupted settings

@@ -34,6 +34,7 @@ The hub can automatically upload sensor data to Adafruit IO for cloud visualizat
 **Feed Creation Behavior:**
 - ✓ **Creates** new feeds for devices that don't have them yet
 - ○ **Skips** devices that already have feeds (safe to run multiple times)
+- ↻ **Updates** existing feed display names if the device name changed
 - ✗ **Reports** any errors (e.g., network issues, invalid credentials)
 
 **Example output:**
@@ -50,14 +51,15 @@ The hub can automatically upload sensor data to Adafruit IO for cloud visualizat
 3. Enable automatic uploads with the toggle switch
 
 ## Feed Naming Convention
-Feeds are named using device MAC addresses to ensure consistency:
+Feeds use MAC addresses for the **key** to ensure consistency, while the **display name** uses the device name:
 
-**Format**: `AABBCCDDEEFF-temp`, `AABBCCDDEEFF-hum`, `AABBCCDDEEFF-bat`
+**Key format**: `AABBCCDDEEFF-temp`, `AABBCCDDEEFF-hum`, `AABBCCDDEEFF-bat`
+**Display name**: `{Device Name} Temperature`, `{Device Name} Humidity`, `{Device Name} Battery`
 
 **Example**: Device with MAC `A4:C1:38:AB:CD:EF` creates:
-- `A4C138ABCDEF-temp` (Temperature feed)
-- `A4C138ABCDEF-hum` (Humidity feed)
-- `A4C138ABCDEF-bat` (Battery feed)
+- key `A4C138ABCDEF-temp` with name `Living Room Temperature`
+- key `A4C138ABCDEF-hum` with name `Living Room Humidity`
+- key `A4C138ABCDEF-bat` with name `Living Room Battery`
 
 **Why MAC addresses?**
 - Device names can change (user can rename devices)
